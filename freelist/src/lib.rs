@@ -28,9 +28,25 @@ use raw::{Header, NIL, Node, TAG, UNIT};
 #[cfg(feature = "stats")]
 use alloc_core::Stats;
 
+/// How the allocator picks a free chunk for a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// The lowest-addressed chunk that fits. Cheap, and tends to keep large
+    /// chunks at the top of the region.
+    First,
+    /// The smallest chunk that fits. Walks the whole list unless it finds an
+    /// exact fit, but leaves fewer mid-sized holes.
+    Best,
+    /// The first chunk that fits at or after the end of the previous
+    /// allocation, wrapping around. Spreads allocations over the region
+    /// instead of piling them up at the bottom.
+    Next,
+}
+
 /// A free-list allocator.
 pub struct FreeList {
     region: Region,
+    fit: Fit,
     state: SpinLock<State>,
 }
 
@@ -40,18 +56,23 @@ struct State {
     /// Whether the initial free chunk has been written. Done lazily because
     /// `new` is a `const fn` and cannot touch region memory.
     ready: bool,
+    /// Where next fit resumes its search. Just an address, not necessarily
+    /// a chunk, so merging and splitting never have to update it.
+    rover: usize,
     #[cfg(feature = "stats")]
     stats: Stats,
 }
 
 impl FreeList {
-    /// Creates an allocator that owns `region`.
-    pub const fn new(region: Region) -> FreeList {
+    /// Creates an allocator that owns `region` and places blocks with `fit`.
+    pub const fn new(region: Region, fit: Fit) -> FreeList {
         FreeList {
             region,
+            fit,
             state: SpinLock::new(State {
                 head: NIL,
                 ready: false,
+                rover: 0,
                 #[cfg(feature = "stats")]
                 stats: Stats::new(),
             }),
@@ -61,6 +82,11 @@ impl FreeList {
     /// The region this allocator manages.
     pub fn region(&self) -> &Region {
         &self.region
+    }
+
+    /// The placement policy chosen at construction.
+    pub fn fit(&self) -> Fit {
+        self.fit
     }
 
     /// The part of the region that can hold chunks: the region trimmed to
@@ -103,7 +129,8 @@ impl FreeList {
         self.state.lock().stats
     }
 
-    /// Allocates a block for `layout`, taking the first free chunk that fits.
+    /// Allocates a block for `layout`, choosing the chunk according to the
+    /// allocator's [`Fit`].
     ///
     /// Fails with [`AllocError::Exhausted`] when no single free chunk is big
     /// enough, even if the free space adds up to more than requested.
@@ -130,19 +157,51 @@ impl FreeList {
     fn take(&self, st: &mut State, layout: Layout) -> Result<usize, AllocError> {
         let size = layout.size().max(1);
         let align = layout.align().max(UNIT);
+        let mut pick: Option<Pick> = None;
         let mut prev = NIL;
         let mut at = st.head;
         while at != NIL {
             // SAFETY: `at` comes from the free list.
             let n = unsafe { raw::node(&self.region, at) };
-            if let Some((payload, end)) = fit(at, n.size, size, align) {
-                self.carve(st, prev, at, n, payload, end);
-                return Ok(payload);
+            if let Some((payload, end)) = place(at, n.size, size, align) {
+                let here = Pick {
+                    prev,
+                    at,
+                    n,
+                    payload,
+                    end,
+                };
+                match self.fit {
+                    Fit::First => {
+                        pick = Some(here);
+                        break;
+                    }
+                    Fit::Best => {
+                        if pick.is_none_or(|p| n.size < p.n.size) {
+                            pick = Some(here);
+                        }
+                        if payload - UNIT == at && end == at + n.size {
+                            break;
+                        }
+                    }
+                    Fit::Next => {
+                        if at >= st.rover {
+                            pick = Some(here);
+                            break;
+                        }
+                        // Keep the lowest fit in case nothing past the rover
+                        // fits and the search has to wrap around.
+                        pick.get_or_insert(here);
+                    }
+                }
             }
             prev = at;
             at = n.next;
         }
-        Err(AllocError::Exhausted)
+        let p = pick.ok_or(AllocError::Exhausted)?;
+        self.carve(st, p.prev, p.at, p.n, p.payload, p.end);
+        st.rover = p.end;
+        Ok(p.payload)
     }
 
     /// Turns the free chunk `at` into a used chunk ending at `end` whose
@@ -347,10 +406,20 @@ impl FreeList {
     }
 }
 
+/// A free chunk chosen by `take`, with the block's position inside it.
+#[derive(Clone, Copy)]
+struct Pick {
+    prev: usize,
+    at: usize,
+    n: Node,
+    payload: usize,
+    end: usize,
+}
+
 /// Where a block of `size` bytes aligned to `align` would go inside the free
 /// chunk `at..at + len`: returns `(payload, end)`, or `None` if it does not
 /// fit. Any overflow also means it does not fit.
-fn fit(at: usize, len: usize, size: usize, align: usize) -> Option<(usize, usize)> {
+fn place(at: usize, len: usize, size: usize, align: usize) -> Option<(usize, usize)> {
     let payload = align_up(at.checked_add(UNIT)?, align)?;
     let end = align_up(payload.checked_add(size)?, UNIT)?;
     (end <= at + len).then_some((payload, end))
@@ -358,7 +427,7 @@ fn fit(at: usize, len: usize, size: usize, align: usize) -> Option<(usize, usize
 
 // SAFETY: blocks are carved out of chunks on the free list only, and a chunk
 // leaves the list before any part of it is handed out, so blocks never
-// overlap each other or the list nodes. `fit` places the payload at an
+// overlap each other or the list nodes. `place` puts the payload at an
 // address aligned to at least the requested alignment and keeps the whole
 // block inside the chunk, which lies inside the region. All list updates
 // happen under the lock.
@@ -434,7 +503,7 @@ mod tests {
         // Start 8 bytes in so the region is not UNIT-aligned on either end.
         let base8 = NonNull::new(base.as_ptr().wrapping_add(8)).unwrap();
         // SAFETY: the buffer outlives `fl` and only `fl` touches it.
-        let fl = FreeList::new(unsafe { Region::new(base8, 1000) });
+        let fl = FreeList::new(unsafe { Region::new(base8, 1000) }, Fit::First);
 
         assert_eq!(fl.capacity(), 992);
         assert_eq!(fl.free_bytes(), 992);
@@ -481,7 +550,7 @@ mod tests {
         // SAFETY: non-zero layout.
         let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
         // SAFETY: the buffer outlives `fl` and only `fl` touches it.
-        let fl = FreeList::new(unsafe { Region::new(base, 1024) });
+        let fl = FreeList::new(unsafe { Region::new(base, 1024) }, Fit::First);
         let l = Layout::from_size_align(48, 16).unwrap();
 
         // SAFETY: each pointer is freed once, with its own layout.
@@ -504,13 +573,76 @@ mod tests {
         unsafe { dealloc(base.as_ptr(), layout) };
     }
 
+    /// Builds holes of 64, 32 and 64 bytes separated by used blocks, then
+    /// asks for a 32-byte chunk and returns where it landed, relative to the
+    /// region start, along with the offset just past the last separator.
+    fn place_in_holes(fit: Fit) -> (usize, usize) {
+        let layout = Layout::from_size_align(1024, 16).unwrap();
+        // SAFETY: non-zero layout.
+        let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        // SAFETY: the buffer outlives `fl` and only `fl` touches it.
+        let fl = FreeList::new(unsafe { Region::new(base, 1024) }, fit);
+        let big = Layout::from_size_align(48, 16).unwrap();
+        let small = Layout::from_size_align(16, 16).unwrap();
+        let start = base.as_ptr().addr();
+
+        // SAFETY: each pointer is freed at most once, with its own layout.
+        let (got, rover) = unsafe {
+            let a = fl.alloc(big);
+            fl.alloc(small);
+            let b = fl.alloc(small);
+            fl.alloc(small);
+            let c = fl.alloc(big);
+            let last = fl.alloc(small);
+            fl.dealloc(a, big);
+            fl.dealloc(b, small);
+            fl.dealloc(c, big);
+            assert_eq!(chunks(&fl).len(), 4);
+            (fl.alloc(small).addr() - start, last.addr() + 16 - start)
+        };
+        // SAFETY: allocated above with this layout.
+        unsafe { dealloc(base.as_ptr(), layout) };
+        (got, rover)
+    }
+
+    #[test]
+    fn policies_pick_different_holes() {
+        // Chunks: a 0..64, sep 64..96, b 96..128, sep 128..160, c 160..224,
+        // last 224..256. Payloads start one header past the chunk.
+        assert_eq!(place_in_holes(Fit::First).0, 16);
+        assert_eq!(place_in_holes(Fit::Best).0, 96 + 16);
+        let (got, rover) = place_in_holes(Fit::Next);
+        assert_eq!(rover, 256);
+        assert_eq!(got, 256 + 16);
+    }
+
+    #[test]
+    fn next_fit_wraps_around() {
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        // SAFETY: non-zero layout.
+        let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        // SAFETY: the buffer outlives `fl` and only `fl` touches it.
+        let fl = FreeList::new(unsafe { Region::new(base, 256) }, Fit::Next);
+        let l = Layout::from_size_align(48, 16).unwrap();
+        // SAFETY: each pointer is freed once, with its own layout.
+        unsafe {
+            let ps: std::vec::Vec<_> = (0..4).map(|_| fl.alloc(l)).collect();
+            assert!(fl.alloc(l).is_null());
+            fl.dealloc(ps[1], l);
+            // Nothing fits past the rover at the end, so it wraps to `ps[1]`.
+            assert_eq!(fl.alloc(l), ps[1]);
+        }
+        // SAFETY: allocated above with this layout.
+        unsafe { dealloc(base.as_ptr(), layout) };
+    }
+
     #[test]
     fn freeing_everything_coalesces_back_to_one_chunk() {
         let layout = Layout::from_size_align(1024, 16).unwrap();
         // SAFETY: non-zero layout.
         let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
         // SAFETY: the buffer outlives `fl` and only `fl` touches it.
-        let fl = FreeList::new(unsafe { Region::new(base, 1024) });
+        let fl = FreeList::new(unsafe { Region::new(base, 1024) }, Fit::First);
         let l = Layout::from_size_align(48, 16).unwrap();
 
         // SAFETY: each pointer is freed once, with its own layout.
@@ -533,7 +665,7 @@ mod tests {
         // SAFETY: non-zero layout.
         let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
         // SAFETY: the buffer outlives `fl` and only `fl` touches it.
-        let fl = FreeList::new(unsafe { Region::new(base, 1024) });
+        let fl = FreeList::new(unsafe { Region::new(base, 1024) }, Fit::First);
         let l = Layout::from_size_align(16, 16).unwrap();
 
         // SAFETY: pointers are used with the layouts they currently have.
