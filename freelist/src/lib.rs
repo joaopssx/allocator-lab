@@ -123,6 +123,22 @@ impl FreeList {
         total
     }
 
+    /// Size of the largest free chunk, header included. A request whose
+    /// header plus rounded payload exceed this cannot succeed.
+    pub fn largest_free(&self) -> usize {
+        let mut st = self.state.lock();
+        self.prepare(&mut st);
+        let mut best = 0;
+        let mut at = st.head;
+        while at != NIL {
+            // SAFETY: `at` comes from the free list.
+            let n = unsafe { raw::node(&self.region, at) };
+            best = best.max(n.size);
+            at = n.next;
+        }
+        best
+    }
+
     /// Snapshot of the allocation counters.
     #[cfg(feature = "stats")]
     pub fn stats(&self) -> Stats {

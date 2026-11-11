@@ -209,6 +209,16 @@ impl Buddy {
             .sum()
     }
 
+    /// Size of the largest free block.
+    pub fn largest_free(&self) -> usize {
+        let mut st = self.state.lock();
+        self.prepare(&mut st);
+        (0..ORDERS)
+            .rev()
+            .find(|&k| st.counts[k] > 0)
+            .map_or(0, block_size)
+    }
+
     /// Snapshot of the allocation counters.
     #[cfg(feature = "stats")]
     pub fn stats(&self) -> Stats {

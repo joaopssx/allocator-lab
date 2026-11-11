@@ -1,0 +1,18 @@
+[package]
+name = "bench"
+description = "Benchmark harness comparing the allocators with the system allocator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+alloc-core = { path = "../core", features = ["stats"] }
+bump = { path = "../bump", features = ["stats"] }
+buddy = { path = "../buddy", features = ["stats"] }
+freelist = { path = "../freelist", features = ["stats"] }
+slab = { path = "../slab", features = ["stats"] }
+
+[lints]
+workspace = true
