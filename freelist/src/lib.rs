@@ -212,19 +212,120 @@ impl FreeList {
         self.insert(st, hdr, h.size);
     }
 
-    /// Links the chunk `at..at + size` into the list, keeping address order.
-    fn insert(&self, st: &mut State, at: usize, size: usize) {
+    /// Returns the free chunks just below and at-or-above `addr` as
+    /// `(prev, next)`, either of which may be `NIL`.
+    fn neighbors(&self, st: &State, addr: usize) -> (usize, usize) {
         let mut prev = NIL;
         let mut next = st.head;
-        while next != NIL && next < at {
+        while next != NIL && next < addr {
             prev = next;
             // SAFETY: `next` comes from the free list.
             next = unsafe { raw::node(&self.region, next) }.next;
         }
+        (prev, next)
+    }
+
+    /// Links the chunk `at..at + size` into the list, keeping address order
+    /// and merging it with the free chunks right before and after it.
+    ///
+    /// After this no two free chunks touch, which is what keeps one large
+    /// request from failing just because the free space is split in pieces
+    /// that happen to be adjacent.
+    fn insert(&self, st: &mut State, at: usize, mut size: usize) {
+        let (prev, next) = self.neighbors(st, at);
+        let mut link = next;
+        if next != NIL && at + size == next {
+            // SAFETY: `next` is on the free list.
+            let n = unsafe { raw::node(&self.region, next) };
+            size += n.size;
+            link = n.next;
+        }
+        if prev != NIL {
+            // SAFETY: `prev` is on the free list.
+            let p = unsafe { raw::node(&self.region, prev) };
+            if prev + p.size == at {
+                let merged = Node {
+                    size: p.size + size,
+                    next: link,
+                };
+                // SAFETY: growing `prev` in place over the chunk being freed
+                // and, maybe, `next`; none of it is live.
+                unsafe { raw::set_node(&self.region, prev, merged) };
+                return;
+            }
+        }
         // SAFETY: `at..at + size` was a used chunk that the caller gave up,
-        // so writing a node over its header aliases nothing live.
-        unsafe { raw::set_node(&self.region, at, Node { size, next }) };
+        // plus maybe the free `next`, so writing a node over it aliases
+        // nothing live.
+        unsafe { raw::set_node(&self.region, at, Node { size, next: link }) };
         self.relink(st, prev, at);
+    }
+
+    /// Resizes the block at `payload` without moving it, if possible.
+    /// Shrinking always works; growing works when the chunk right after this
+    /// one is free and large enough.
+    ///
+    /// # Safety
+    ///
+    /// `payload` must be a live block of this allocator.
+    unsafe fn resize(&self, st: &mut State, payload: usize, new_size: usize) -> bool {
+        let hdr = payload - UNIT;
+        // SAFETY: live payloads are preceded by their header.
+        let h = unsafe { raw::header(&self.region, hdr) };
+        let end = hdr + h.size;
+        let Some(need) = payload
+            .checked_add(new_size)
+            .and_then(|e| align_up(e, UNIT))
+        else {
+            return false;
+        };
+
+        if need <= end {
+            if need < end {
+                // SAFETY: the chunk keeps `hdr..need`, a prefix of itself.
+                unsafe { self.set_size(hdr, need - hdr) };
+                self.insert(st, need, end - need);
+            }
+            return true;
+        }
+
+        let (prev, next) = self.neighbors(st, end);
+        if next != end {
+            return false;
+        }
+        // SAFETY: `next` is on the free list.
+        let n = unsafe { raw::node(&self.region, next) };
+        if end + n.size < need {
+            return false;
+        }
+        let mut link = n.next;
+        if need < end + n.size {
+            let rest = Node {
+                size: end + n.size - need,
+                next: link,
+            };
+            // SAFETY: `need..end + n.size` is the unused tail of the free
+            // chunk being absorbed.
+            unsafe { raw::set_node(&self.region, need, rest) };
+            link = need;
+        }
+        self.relink(st, prev, link);
+        // SAFETY: `end..need` was just unlinked from the free list, so the
+        // chunk now owns `hdr..need`.
+        unsafe { self.set_size(hdr, need - hdr) };
+        true
+    }
+
+    /// Rewrites the size in the header at `hdr`.
+    ///
+    /// # Safety
+    ///
+    /// `hdr` must be the header of a live chunk, and `hdr..hdr + size` must
+    /// be memory that chunk owns after the resize.
+    unsafe fn set_size(&self, hdr: usize, size: usize) {
+        let h = Header { size, tag: TAG };
+        // SAFETY: `hdr` is a live header (caller contract).
+        unsafe { raw::set_header(&self.region, hdr, h) };
     }
 
     fn prepare(&self, st: &mut State) {
@@ -285,6 +386,36 @@ unsafe impl GlobalAlloc for FreeList {
             unsafe { ptr::write_bytes(p, 0, layout.size()) };
         }
         p
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let mut st = self.state.lock();
+        // SAFETY: `ptr` is a live block of this allocator (caller contract).
+        let res = if unsafe { self.resize(&mut st, ptr.addr(), new_size) } {
+            Ok(ptr)
+        } else {
+            // SAFETY: the caller guarantees `new_size`, rounded up to the
+            // alignment, does not overflow `isize`.
+            let new = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+            self.take(&mut st, new).map(|dst| {
+                let dst = self.region.ptr(dst);
+                // SAFETY: `resize` only fails when growing, so the old block
+                // has `layout.size()` bytes, all of which fit in `dst`. The
+                // new block came off the free list, so it does not overlap
+                // the old one. Releasing afterwards gives the old chunk back.
+                unsafe {
+                    ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                    self.release(&mut st, ptr.addr());
+                }
+                dst
+            })
+        };
+        #[cfg(feature = "stats")]
+        match res {
+            Ok(_) => st.stats.on_realloc(layout.size(), new_size),
+            Err(_) => st.stats.on_failure(),
+        }
+        res.unwrap_or(ptr::null_mut())
     }
 }
 
@@ -369,6 +500,70 @@ mod tests {
             assert_eq!(fl.alloc(l), ps[0]);
         }
 
+        // SAFETY: allocated above with this layout.
+        unsafe { dealloc(base.as_ptr(), layout) };
+    }
+
+    #[test]
+    fn freeing_everything_coalesces_back_to_one_chunk() {
+        let layout = Layout::from_size_align(1024, 16).unwrap();
+        // SAFETY: non-zero layout.
+        let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        // SAFETY: the buffer outlives `fl` and only `fl` touches it.
+        let fl = FreeList::new(unsafe { Region::new(base, 1024) });
+        let l = Layout::from_size_align(48, 16).unwrap();
+
+        // SAFETY: each pointer is freed once, with its own layout.
+        unsafe {
+            let ps: std::vec::Vec<_> = (0..8).map(|_| fl.alloc(l)).collect();
+            // Middle first, then both neighbors, then the rest: exercises
+            // merging with the next chunk, the previous one, and both.
+            for i in [3, 2, 4, 0, 7, 1, 5, 6] {
+                fl.dealloc(ps[i], l);
+            }
+        }
+        assert_eq!(chunks(&fl), [(base.as_ptr().addr(), 1024)]);
+        // SAFETY: allocated above with this layout.
+        unsafe { dealloc(base.as_ptr(), layout) };
+    }
+
+    #[test]
+    fn realloc_grows_into_free_neighbor_and_shrinks_in_place() {
+        let layout = Layout::from_size_align(1024, 16).unwrap();
+        // SAFETY: non-zero layout.
+        let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        // SAFETY: the buffer outlives `fl` and only `fl` touches it.
+        let fl = FreeList::new(unsafe { Region::new(base, 1024) });
+        let l = Layout::from_size_align(16, 16).unwrap();
+
+        // SAFETY: pointers are used with the layouts they currently have.
+        unsafe {
+            let a = fl.alloc(l);
+            let b = fl.alloc(l);
+            a.write_bytes(0x5a, 16);
+            fl.dealloc(b, l);
+
+            // `b` is free and adjacent, so `a` grows over it.
+            let a2 = fl.realloc(a, l, 100);
+            assert_eq!(a2, a);
+            assert!((0..16).all(|i| a.add(i).read() == 0x5a));
+            assert_eq!(fl.free_bytes(), 1024 - 16 - 112);
+
+            // Shrinking gives the tail back and it merges with what follows.
+            let l100 = Layout::from_size_align(100, 16).unwrap();
+            assert_eq!(fl.realloc(a, l100, 8), a);
+            assert_eq!(fl.free_bytes(), 1024 - 32);
+            assert_eq!(chunks(&fl).len(), 1);
+
+            // With a used block in the way, growing has to move.
+            let c = fl.alloc(l);
+            let a3 = fl.realloc(a, l, 64);
+            assert_ne!(a3, a);
+            assert!((0..8).all(|i| a3.add(i).read() == 0x5a));
+            fl.dealloc(c, l);
+            fl.dealloc(a3, Layout::from_size_align(64, 16).unwrap());
+        }
+        assert_eq!(fl.free_bytes(), 1024);
         // SAFETY: allocated above with this layout.
         unsafe { dealloc(base.as_ptr(), layout) };
     }
