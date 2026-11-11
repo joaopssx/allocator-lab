@@ -1,6 +1,7 @@
 [package]
 name = "slab"
 description = "Slab allocator with power-of-two size classes"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
