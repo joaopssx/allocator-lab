@@ -125,6 +125,26 @@ impl Geometry {
     fn bit(&self, k: usize, addr: usize) -> usize {
         self.starts[k] + ((addr - self.base) >> (MIN_SHIFT as usize + k))
     }
+
+    /// Address of the buddy of the order-`k` block at `addr`.
+    ///
+    /// The two halves of a block of order `k + 1` differ only in bit
+    /// `MIN_SHIFT + k` of their offset, so flipping that bit maps each half
+    /// to the other. The result may lie past the end of the area, when the
+    /// block is a root whose buddy was never part of it.
+    fn buddy(&self, k: usize, addr: usize) -> usize {
+        self.base + ((addr - self.base) ^ block_size(k))
+    }
+
+    /// Whether the order-`k` block at `addr` is the upper half of its parent.
+    fn is_upper(&self, k: usize, addr: usize) -> bool {
+        (addr - self.base) & block_size(k) != 0
+    }
+
+    /// Whether an order-`k` block at `addr` would lie entirely in the area.
+    fn fits(&self, k: usize, addr: usize) -> bool {
+        addr + block_size(k) <= self.base + self.space
+    }
 }
 
 impl Buddy {
@@ -213,6 +233,45 @@ impl Buddy {
             unsafe { self.push(st, k, addr + block_size(k)) };
         }
         Ok(addr)
+    }
+
+    /// Whether the order-`k` block at `addr` is on list `k`.
+    fn is_free(&self, st: &State, k: usize, addr: usize) -> bool {
+        if !st.geo.fits(k, addr) {
+            return false;
+        }
+        // SAFETY: the block is inside the area, so its bit is inside the
+        // bitmap.
+        unsafe { raw::bit(&self.region, st.geo.map, st.geo.bit(k, addr)) }
+    }
+
+    /// Resizes the order-`k` block at `addr` to order `want` without moving
+    /// it, if possible. Shrinking always works. Growing works when the block
+    /// is the lower half at every level up to `want` and every upper half
+    /// on the way is free.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must be a live block of order `k`.
+    unsafe fn resize(&self, st: &mut State, addr: usize, k: usize, want: usize) -> bool {
+        if want <= k {
+            for j in (want..k).rev() {
+                // SAFETY: the upper half of the part being given back is no
+                // longer used by the block.
+                unsafe { self.push(st, j, addr + block_size(j)) };
+            }
+            return true;
+        }
+        let ok = (k..want)
+            .all(|j| !st.geo.is_upper(j, addr) && self.is_free(st, j, st.geo.buddy(j, addr)));
+        if ok {
+            for j in k..want {
+                let b = st.geo.buddy(j, addr);
+                // SAFETY: checked above that `b` is on list `j`.
+                unsafe { self.remove(st, j, b) };
+            }
+        }
+        ok
     }
 
     /// Unlinks the order-`k` block at `addr` from list `k`.
@@ -333,6 +392,38 @@ unsafe impl GlobalAlloc for Buddy {
         }
         p
     }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller guarantees `new_size`, rounded up to the
+        // alignment, does not overflow `isize`.
+        let new = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        let (Some(k), Some(want)) = (order_of(layout), order_of(new)) else {
+            return ptr::null_mut();
+        };
+        let mut st = self.state.lock();
+        // SAFETY: `ptr` is a live block of order `k` (caller contract).
+        let res = if unsafe { self.resize(&mut st, ptr.addr(), k, want) } {
+            Ok(ptr)
+        } else {
+            self.take(&mut st, want).map(|dst| {
+                let dst = self.region.ptr(dst);
+                // SAFETY: `resize` only fails when growing, so `dst` is a
+                // distinct free block larger than the old one; the old block
+                // is released after the copy.
+                unsafe {
+                    ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                    self.push(&mut st, k, ptr.addr());
+                }
+                dst
+            })
+        };
+        #[cfg(feature = "stats")]
+        match res {
+            Ok(_) => st.stats.on_realloc(layout.size(), new_size),
+            Err(_) => st.stats.on_failure(),
+        }
+        res.unwrap_or(ptr::null_mut())
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +467,70 @@ mod tests {
         assert_eq!(roots, [2, 4, 5, 6, 7, 9]);
         drop(st);
 
+        // SAFETY: allocated above with this layout.
+        unsafe { dealloc(base.as_ptr(), layout) };
+    }
+
+    #[test]
+    fn buddy_is_one_bit_flip_away() {
+        let g = Geometry {
+            base: 0x10000,
+            space: 4096,
+            map: 0x11000,
+            starts: [0; ORDERS],
+        };
+        assert_eq!(g.buddy(0, 0x10000), 0x10010);
+        assert_eq!(g.buddy(0, 0x10010), 0x10000);
+        assert_eq!(g.buddy(1, 0x10020), 0x10000);
+        assert_eq!(g.buddy(4, 0x10100), 0x10000);
+        assert_eq!(g.buddy(4, 0x10300), 0x10200);
+        // A root's buddy can fall outside the area.
+        assert_eq!(g.buddy(8, 0x10000), 0x11000);
+        assert!(!g.fits(8, 0x11000));
+        assert!(g.is_upper(4, 0x10300));
+        assert!(g.is_upper(5, 0x10200));
+        assert!(!g.is_upper(5, 0x10400));
+        // The buddy relation is an involution at every order.
+        for k in 0..8 {
+            for i in 0..(4096 >> (4 + k)) {
+                let a = 0x10000 + i * block_size(k);
+                assert_eq!(g.buddy(k, g.buddy(k, a)), a);
+            }
+        }
+    }
+
+    #[test]
+    fn realloc_grows_into_free_buddies_and_shrinks_in_place() {
+        let size = 4096 * 65 / 64 + 64;
+        let layout = Layout::from_size_align(size, 4096).unwrap();
+        // SAFETY: non-zero layout.
+        let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        // SAFETY: the buffer outlives `b` and only `b` touches it.
+        let b = Buddy::new(unsafe { Region::new(base, size) });
+        assert_eq!(b.capacity(), 4096);
+
+        // SAFETY: each pointer is used with the layout it currently has.
+        unsafe {
+            let p = b.alloc(l(16, 1));
+            p.write_bytes(0x77, 16);
+            // Everything above `p` is free buddies, so it can grow in place.
+            let q = b.realloc(p, l(16, 1), 1000);
+            assert_eq!(q, p);
+            assert!((0..16).all(|i| p.add(i).read() == 0x77));
+            assert_eq!(b.free_bytes(), 4096 - 1024);
+
+            // Shrinking hands the upper halves back.
+            assert_eq!(b.realloc(p, l(1000, 1), 20), p);
+            assert_eq!(b.free_bytes(), 4096 - 32);
+
+            // An upper half cannot grow in place: it has to move.
+            let r = b.alloc(l(32, 1));
+            assert_eq!(r.addr(), p.addr() + 32);
+            r.write(5);
+            let r2 = b.realloc(r, l(32, 1), 64);
+            assert_ne!(r2, r);
+            assert_eq!(r2.read(), 5);
+        }
         // SAFETY: allocated above with this layout.
         unsafe { dealloc(base.as_ptr(), layout) };
     }

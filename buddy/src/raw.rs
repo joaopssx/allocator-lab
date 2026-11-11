@@ -41,6 +41,16 @@ pub(crate) unsafe fn set_node(region: &Region, addr: usize, n: Node) {
     unsafe { region.ptr(addr).cast::<Node>().write(n) }
 }
 
+/// Reads bit `idx` of the bitmap starting at `map`.
+///
+/// # Safety
+///
+/// `map + idx / 8` must be inside the bitmap area of the region.
+pub(crate) unsafe fn bit(region: &Region, map: usize, idx: usize) -> bool {
+    // SAFETY: the byte is inside the bitmap (caller contract).
+    unsafe { region.ptr(map + idx / 8).read() & (1 << (idx % 8)) != 0 }
+}
+
 /// Sets bit `idx` of the bitmap starting at `map`.
 ///
 /// # Safety
