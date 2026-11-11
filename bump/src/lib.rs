@@ -1,7 +1,13 @@
 //! Bump allocator over a fixed [`Region`].
 //!
 //! Allocation moves a cursor forward. Freeing an individual block does
-//! nothing; memory comes back only when the whole allocator is reset.
+//! nothing; memory comes back only through [`Bump::reset`], which drops
+//! everything at once.
+//!
+//! `realloc` grows or shrinks the most recent block in place by moving the
+//! cursor, which is the common case for a `Vec` that keeps pushing. Shrinking
+//! any other block also stays in place, the tail is simply wasted. Growing any
+//! other block has to move it.
 //!
 //! Zero-sized requests are served as one-byte allocations, so every pointer
 //! this allocator returns is unique and inside the region.
@@ -41,6 +47,9 @@ pub struct Bump {
 struct State {
     /// Offset of the first unused byte. Never exceeds the region size.
     next: usize,
+    /// Offset of the most recent block, the only one realloc can grow in
+    /// place. `None` before the first allocation and after a reset.
+    last: Option<usize>,
     #[cfg(feature = "stats")]
     stats: Stats,
 }
@@ -52,6 +61,7 @@ impl Bump {
             region,
             state: SpinLock::new(State {
                 next: 0,
+                last: None,
                 #[cfg(feature = "stats")]
                 stats: Stats::new(),
             }),
@@ -72,6 +82,22 @@ impl Bump {
     #[cfg(feature = "stats")]
     pub fn stats(&self) -> Stats {
         self.state.lock().stats
+    }
+
+    /// Releases every block at once and starts again from the beginning of
+    /// the region.
+    ///
+    /// # Safety
+    ///
+    /// Every block handed out before the reset must be dead: no reads, writes,
+    /// `realloc` or `dealloc` through any of those pointers afterwards. The
+    /// memory is handed out again as is, without being cleared.
+    pub unsafe fn reset(&self) {
+        let mut st = self.state.lock();
+        st.next = 0;
+        st.last = None;
+        #[cfg(feature = "stats")]
+        st.stats.on_reset();
     }
 
     /// Allocates a block for `layout`.
@@ -100,6 +126,7 @@ impl Bump {
             return Err(AllocError::Exhausted);
         }
         st.next = end - self.region.start();
+        st.last = Some(addr - self.region.start());
         NonNull::new(self.region.ptr(addr)).ok_or(AllocError::Exhausted)
     }
 }
@@ -107,7 +134,8 @@ impl Bump {
 // SAFETY: every block comes from `bump`, which only hands out ranges in
 // `[start + next, end)` and then moves `next` past them, all under the lock.
 // So blocks never overlap, are aligned as requested and stay inside the
-// region, which the `Region` contract keeps valid. Nothing is reused until
+// region, which the `Region` contract keeps valid. In-place `realloc` only
+// moves `next` when the block is `last`, i.e. nothing was handed out after it. Nothing is reused until
 // `reset`, whose own contract requires all blocks to be dead.
 unsafe impl GlobalAlloc for Bump {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -136,19 +164,39 @@ unsafe impl GlobalAlloc for Bump {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: the caller guarantees `new_size` rounded to the alignment
-        // does not overflow `isize`, which is all `Layout` asks for.
-        let new = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let Ok(dst) = self.try_alloc(new) else {
-            return ptr::null_mut();
+        let mut st = self.state.lock();
+        let off = ptr.addr() - self.region.start();
+        let is_last = st.last == Some(off);
+
+        let res = if new_size <= layout.size() {
+            if is_last {
+                st.next = off + new_size.max(1);
+            }
+            Ok(ptr)
+        } else if is_last && off + new_size <= self.region.size() {
+            // `off + new_size` cannot overflow: `off` is inside the region
+            // and the caller guarantees `new_size <= isize::MAX`.
+            st.next = off + new_size;
+            Ok(ptr)
+        } else {
+            // SAFETY: the caller guarantees `new_size`, rounded up to the
+            // alignment, does not overflow `isize`, which is all `Layout`
+            // requires.
+            let new = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+            self.bump(&mut st, new).map(|dst| {
+                // SAFETY: `ptr` is live for `layout.size()` bytes (caller
+                // contract) and `dst` is a fresh block of `new_size` bytes,
+                // so both ranges are valid and do not overlap.
+                unsafe { ptr::copy_nonoverlapping(ptr, dst.as_ptr(), layout.size()) };
+                dst.as_ptr()
+            })
         };
-        // SAFETY: `ptr` is live for `layout.size()` bytes (caller contract),
-        // `dst` is a fresh block of at least `new_size` bytes, and blocks
-        // never overlap.
-        unsafe {
-            ptr::copy_nonoverlapping(ptr, dst.as_ptr(), layout.size().min(new_size));
-            self.dealloc(ptr, layout);
+
+        #[cfg(feature = "stats")]
+        match res {
+            Ok(_) => st.stats.on_realloc(layout.size(), new_size),
+            Err(_) => st.stats.on_failure(),
         }
-        dst.as_ptr()
+        res.unwrap_or(ptr::null_mut())
     }
 }

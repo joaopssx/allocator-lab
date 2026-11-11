@@ -12,7 +12,8 @@
 /// figures is how the benchmarks measure internal fragmentation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Successful allocations, including the new block of a moving realloc.
+    /// Successful allocations. A `realloc` counts only in `reallocs`, even
+    /// when it moves the block.
     pub allocs: u64,
     /// Blocks returned through `dealloc`.
     pub deallocs: u64,
@@ -64,6 +65,11 @@ impl Stats {
         } else {
             self.live_bytes = self.live_bytes.saturating_sub(old - new);
         }
+    }
+
+    /// Records that every live block was released at once.
+    pub fn on_reset(&mut self) {
+        self.live_bytes = 0;
     }
 
     /// Records a request that could not be served.
