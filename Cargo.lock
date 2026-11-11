@@ -28,6 +28,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "shared-tests"
+version = "0.1.0"
+dependencies = [
+ "alloc-core",
+ "buddy",
+ "bump",
+ "freelist",
+ "slab",
+]
+
+[[package]]
 name = "slab"
 version = "0.1.0"
 dependencies = [
