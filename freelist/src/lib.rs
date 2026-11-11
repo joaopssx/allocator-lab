@@ -20,8 +20,13 @@
 mod raw;
 
 use alloc_core::align::{align_down, align_up};
-use alloc_core::{Region, SpinLock};
-use raw::{NIL, Node, UNIT};
+use alloc_core::{AllocError, Region, SpinLock};
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::{self, NonNull};
+use raw::{Header, NIL, Node, TAG, UNIT};
+
+#[cfg(feature = "stats")]
+use alloc_core::Stats;
 
 /// A free-list allocator.
 pub struct FreeList {
@@ -35,6 +40,8 @@ struct State {
     /// Whether the initial free chunk has been written. Done lazily because
     /// `new` is a `const fn` and cannot touch region memory.
     ready: bool,
+    #[cfg(feature = "stats")]
+    stats: Stats,
 }
 
 impl FreeList {
@@ -45,6 +52,8 @@ impl FreeList {
             state: SpinLock::new(State {
                 head: NIL,
                 ready: false,
+                #[cfg(feature = "stats")]
+                stats: Stats::new(),
             }),
         }
     }
@@ -88,6 +97,106 @@ impl FreeList {
         total
     }
 
+    /// Snapshot of the allocation counters.
+    #[cfg(feature = "stats")]
+    pub fn stats(&self) -> Stats {
+        self.state.lock().stats
+    }
+
+    /// Allocates a block for `layout`, taking the first free chunk that fits.
+    ///
+    /// Fails with [`AllocError::Exhausted`] when no single free chunk is big
+    /// enough, even if the free space adds up to more than requested.
+    pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        let mut st = self.state.lock();
+        self.prepare(&mut st);
+        let res = self.take(&mut st, layout);
+        #[cfg(feature = "stats")]
+        match res {
+            Ok(_) => st.stats.on_alloc(layout.size()),
+            Err(_) => st.stats.on_failure(),
+        }
+        res.map(|p| self.nonnull(p))
+    }
+
+    fn nonnull(&self, addr: usize) -> NonNull<u8> {
+        // Region addresses come from a `NonNull` base and never wrap, so the
+        // fallback is unreachable; it only avoids an `unsafe` block.
+        NonNull::new(self.region.ptr(addr)).unwrap_or(NonNull::dangling())
+    }
+
+    /// Finds a chunk for `layout`, carves the block out of it and returns the
+    /// payload address.
+    fn take(&self, st: &mut State, layout: Layout) -> Result<usize, AllocError> {
+        let size = layout.size().max(1);
+        let align = layout.align().max(UNIT);
+        let mut prev = NIL;
+        let mut at = st.head;
+        while at != NIL {
+            // SAFETY: `at` comes from the free list.
+            let n = unsafe { raw::node(&self.region, at) };
+            if let Some((payload, end)) = fit(at, n.size, size, align) {
+                self.carve(st, prev, at, n, payload, end);
+                return Ok(payload);
+            }
+            prev = at;
+            at = n.next;
+        }
+        Err(AllocError::Exhausted)
+    }
+
+    /// Turns the free chunk `at` into a used chunk ending at `end` whose
+    /// payload starts at `payload`. Whatever is left in front of the header
+    /// and after `end` goes back on the list in place of `at`.
+    fn carve(&self, st: &mut State, prev: usize, at: usize, n: Node, payload: usize, end: usize) {
+        let hdr = payload - UNIT;
+        let chunk_end = at + n.size;
+        let mut link = n.next;
+        // `at`, `hdr`, `end` and `chunk_end` are all UNIT-aligned, so both
+        // leftovers are multiples of UNIT: either empty or a valid chunk.
+        if end < chunk_end {
+            let tail = Node {
+                size: chunk_end - end,
+                next: link,
+            };
+            // SAFETY: `end..chunk_end` is part of the free chunk `at`, past
+            // the new block.
+            unsafe { raw::set_node(&self.region, end, tail) };
+            link = end;
+        }
+        if hdr > at {
+            let front = Node {
+                size: hdr - at,
+                next: link,
+            };
+            // SAFETY: `at..hdr` is part of the free chunk, before the block.
+            unsafe { raw::set_node(&self.region, at, front) };
+            link = at;
+        }
+        self.relink(st, prev, link);
+
+        let h = Header {
+            size: end - hdr,
+            tag: TAG,
+        };
+        // SAFETY: `hdr..payload` is UNIT bytes inside the old free chunk and
+        // does not overlap either leftover node written above.
+        unsafe { raw::set_header(&self.region, hdr, h) };
+    }
+
+    /// Points `prev` (or the head, if `prev` is `NIL`) at `to`.
+    fn relink(&self, st: &mut State, prev: usize, to: usize) {
+        if prev == NIL {
+            st.head = to;
+        } else {
+            // SAFETY: `prev` is a free chunk on the list.
+            let mut p = unsafe { raw::node(&self.region, prev) };
+            p.next = to;
+            // SAFETY: rewriting the node of a free chunk in place.
+            unsafe { raw::set_node(&self.region, prev, p) };
+        }
+    }
+
     fn prepare(&self, st: &mut State) {
         if st.ready {
             return;
@@ -107,16 +216,52 @@ impl FreeList {
     }
 }
 
+/// Where a block of `size` bytes aligned to `align` would go inside the free
+/// chunk `at..at + len`: returns `(payload, end)`, or `None` if it does not
+/// fit. Any overflow also means it does not fit.
+fn fit(at: usize, len: usize, size: usize, align: usize) -> Option<(usize, usize)> {
+    let payload = align_up(at.checked_add(UNIT)?, align)?;
+    let end = align_up(payload.checked_add(size)?, UNIT)?;
+    (end <= at + len).then_some((payload, end))
+}
+
+// SAFETY: blocks are carved out of chunks on the free list only, and a chunk
+// leaves the list before any part of it is handed out, so blocks never
+// overlap each other or the list nodes. `fit` places the payload at an
+// address aligned to at least the requested alignment and keeps the whole
+// block inside the chunk, which lies inside the region. All list updates
+// happen under the lock.
+unsafe impl GlobalAlloc for FreeList {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.try_alloc(layout)
+            .map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Chunks are not given back yet.
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = self
+            .try_alloc(layout)
+            .map_or(ptr::null_mut(), NonNull::as_ptr);
+        if !p.is_null() {
+            // SAFETY: fresh block of at least `layout.size()` bytes.
+            unsafe { ptr::write_bytes(p, 0, layout.size()) };
+        }
+        p
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
 
     use super::*;
-    use core::ptr::NonNull;
-    use std::alloc::{Layout, alloc, dealloc};
+    use std::alloc::{alloc, dealloc};
 
     #[test]
-    fn fresh_list_is_one_chunk_trimmed_to_units() {
+    fn first_fit_splits_and_respects_alignment() {
         let layout = Layout::from_size_align(1024, 16).unwrap();
         // SAFETY: non-zero layout.
         let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
@@ -127,6 +272,25 @@ mod tests {
 
         assert_eq!(fl.capacity(), 992);
         assert_eq!(fl.free_bytes(), 992);
+
+        // 8 bytes of payload plus the header round to 32.
+        let p = fl.try_alloc(Layout::new::<u64>()).unwrap();
+        assert_eq!(p.as_ptr().addr() % 16, 0);
+        assert_eq!(fl.free_bytes(), 992 - 32);
+
+        // A 256-aligned block leaves the gap in front of it on the list, so
+        // only header plus payload are taken.
+        let q = fl
+            .try_alloc(Layout::from_size_align(16, 256).unwrap())
+            .unwrap();
+        assert_eq!(q.as_ptr().addr() % 256, 0);
+        assert_eq!(fl.free_bytes(), 992 - 64);
+
+        assert!(
+            fl.try_alloc(Layout::from_size_align(1000, 1).unwrap())
+                .is_err()
+        );
+
         // SAFETY: allocated above with this layout.
         unsafe { dealloc(base.as_ptr(), layout) };
     }

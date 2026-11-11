@@ -4,9 +4,6 @@
 //! Every function takes an address and trusts the caller that a value of the
 //! right type lives there, which the list invariants in `lib.rs` guarantee.
 
-// Headers are only written once allocation lands; the layout comes first.
-#![allow(dead_code)]
-
 use alloc_core::Region;
 
 /// Granularity of every chunk: chunk starts and sizes are multiples of this.
@@ -62,17 +59,6 @@ pub(crate) unsafe fn set_node(region: &Region, addr: usize, n: Node) {
     // SAFETY: aligned, in bounds and not aliased by any payload (caller
     // contract).
     unsafe { region.ptr(addr).cast::<Node>().write(n) }
-}
-
-/// Reads the header of the used chunk at `addr`.
-///
-/// # Safety
-///
-/// `addr` must be UNIT-aligned with `addr..addr + UNIT` inside `region`.
-pub(crate) unsafe fn header(region: &Region, addr: usize) -> Header {
-    // SAFETY: aligned and in bounds (caller contract). Headers are never
-    // part of a payload, so the caller's data cannot be torn by this read.
-    unsafe { region.ptr(addr).cast::<Header>().read() }
 }
 
 /// Writes the header of a used chunk at `addr`.
