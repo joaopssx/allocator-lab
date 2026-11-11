@@ -221,6 +221,56 @@ pub fn check_accounting<A: Lab>(a: &A, live: &[Block]) {
     );
 }
 
+/// Uses `Vec`, `String`, `Box` and `HashMap` the way ordinary code does,
+/// through whatever `#[global_allocator]` the calling binary installed.
+/// No single allocation is meant to go much past `max` bytes, so the slab
+/// allocator can run it with `max = 2048`.
+pub fn exercise_std(max: usize) {
+    use std::collections::HashMap;
+
+    // Growth by doubling: the final capacity stays within `max` bytes.
+    let n = max / 16;
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..n as u64 {
+        v.push(i * i);
+    }
+    assert_eq!(v.iter().sum::<u64>(), (0..n as u64).map(|i| i * i).sum());
+    v.truncate(n / 3);
+    v.shrink_to_fit();
+    assert_eq!(v.len(), n / 3);
+
+    let mut s = String::new();
+    while s.len() + 10 < max / 2 {
+        s.push_str("allocator ");
+    }
+    assert!(s.starts_with("allocator allocator"));
+    let upper = s.to_uppercase();
+    assert_eq!(upper.len(), s.len());
+
+    let b = Box::new([7u8; 64]);
+    let f: Box<dyn Fn(u32) -> u32> = Box::new(move |x| x + b[0] as u32);
+    assert_eq!(f(1), 8);
+
+    let mut many: Vec<Box<u32>> = (0..(max / 64) as u32).map(Box::new).collect();
+    many.retain(|b| **b % 3 != 0);
+    assert!(many.iter().all(|b| **b % 3 != 0));
+
+    // An entry is 32 bytes and the table keeps a power-of-two number of
+    // buckets at most 7/8 full, plus a control byte each. `max / 128`
+    // entries keeps the table under `max` bytes.
+    let entries = (max / 128) as u32;
+    let mut m: HashMap<u32, String> = HashMap::new();
+    for i in 0..entries {
+        m.insert(i, i.to_string());
+    }
+    for i in (0..entries).step_by(2) {
+        assert_eq!(m.remove(&i), Some(i.to_string()));
+    }
+    for i in 0..entries {
+        assert_eq!(m.contains_key(&i), i % 2 == 1);
+    }
+}
+
 /// Byte pattern for block number `n`, so a block overwritten by another
 /// block or by allocator metadata shows up when it is checked.
 pub fn tag(n: usize) -> u8 {
