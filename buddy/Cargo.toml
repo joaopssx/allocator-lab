@@ -1,0 +1,17 @@
+[package]
+name = "buddy"
+description = "Binary buddy allocator with bitmap-backed merging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+alloc-core = { path = "../core" }
+
+[features]
+stats = ["alloc-core/stats"]
+
+[lints]
+workspace = true
