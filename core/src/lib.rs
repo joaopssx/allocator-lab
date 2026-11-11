@@ -7,3 +7,8 @@
 #![no_std]
 
 pub mod align;
+pub mod error;
+pub mod region;
+
+pub use error::AllocError;
+pub use region::{Arena, Region};
