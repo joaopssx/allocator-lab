@@ -16,3 +16,6 @@ slab = { path = "../slab" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+proptest = "1.12.0"

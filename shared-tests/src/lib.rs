@@ -145,6 +145,16 @@ impl Lab for Buddy {
     }
 }
 
+/// Whether the full test profile was requested with `LAB_FULL=1`.
+///
+/// The default profile is sized so the whole workspace runs under Miri in a
+/// few minutes. The full one runs many more random cases and is meant for
+/// local runs, natively or under Miri with
+/// `MIRIFLAGS=-Zmiri-env-forward=LAB_FULL`.
+pub fn full() -> bool {
+    std::env::var_os("LAB_FULL").is_some_and(|v| v == "1")
+}
+
 /// Runs `f` with an allocator of type `A`, in configuration `variant`, over a
 /// fresh `size`-byte buffer aligned to 4096.
 pub fn with<A: Lab, R>(size: usize, variant: usize, f: impl FnOnce(&A) -> R) -> R {
