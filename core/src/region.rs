@@ -4,7 +4,7 @@
 //! to touch those bytes. That is why it is neither `Copy` nor `Clone`, and why
 //! the constructors are `unsafe`. Once an allocator owns a region, every pointer
 //! it hands out is derived from the region's base pointer with
-//! [`pointer::with_addr`], so provenance stays intact and Miri can check it.
+//! `with_addr`, so provenance stays intact and Miri can check it.
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
