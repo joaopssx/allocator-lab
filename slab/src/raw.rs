@@ -1,34 +1,44 @@
-//! Free-list links stored inside free blocks.
+//! Per-slab metadata, stored in a table at the end of the region.
 //!
-//! The only module in the crate that dereferences region pointers. A free
-//! block holds the address of the next free block of the same class in its
-//! first word; used blocks carry no metadata at all.
+//! The only module in the crate that dereferences region pointers, and it
+//! only touches the table. Block memory is never read or written by the
+//! allocator: a block freed through a `Box` that is still a protected function
+//! argument can be reused without the allocator writing into it.
 
 use alloc_core::Region;
 
-/// Marks the end of a class's free list.
-pub(crate) const NIL: usize = 0;
-
-/// Reads the link stored in the free block at `addr`.
-///
-/// # Safety
-///
-/// `addr` must be a free block of this allocator.
-pub(crate) unsafe fn next(region: &Region, addr: usize) -> usize {
-    // SAFETY: blocks are at least 16 bytes and aligned to their size, so a
-    // `usize` at the start is in bounds and aligned. The block is free, so
-    // the word holds a link written by `set_next`.
-    unsafe { region.ptr(addr).cast::<usize>().read() }
+/// Bookkeeping for one slab.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Meta {
+    /// One bit per block, set while the block is free. A slab has at most
+    /// 4096 / 16 = 256 blocks.
+    pub free: [u64; 4],
+    /// Next slab of the same class that has free blocks, as index + 1, or 0.
+    pub next: usize,
+    /// Number of set bits in `free`.
+    pub nfree: usize,
 }
 
-/// Stores `to` as the link of the block at `addr`.
+/// Reads the entry at `addr`.
 ///
 /// # Safety
 ///
-/// `addr` must be a block of this allocator that the caller has just given
-/// up, so no live data is overwritten.
-pub(crate) unsafe fn set_next(region: &Region, addr: usize, to: usize) {
-    // SAFETY: in bounds and aligned as in `next`; the block is no longer
-    // live (caller contract).
-    unsafe { region.ptr(addr).cast::<usize>().write(to) }
+/// `addr` must be the entry of a carved slab in the table.
+pub(crate) unsafe fn meta(region: &Region, addr: usize) -> Meta {
+    // SAFETY: table entries are aligned to `Meta` (the table starts on a
+    // slab boundary and entries are `size_of::<Meta>()` apart) and lie in the
+    // table, which no block overlaps. Carved entries were written by
+    // `set_meta`.
+    unsafe { region.ptr(addr).cast::<Meta>().read() }
+}
+
+/// Writes the entry at `addr`.
+///
+/// # Safety
+///
+/// `addr` must be an entry of the table.
+pub(crate) unsafe fn set_meta(region: &Region, addr: usize, m: Meta) {
+    // SAFETY: as in `meta`.
+    unsafe { region.ptr(addr).cast::<Meta>().write(m) }
 }

@@ -1,7 +1,7 @@
 //! Class boundaries and exhaustion for the slab allocator.
 
 use alloc_core::{AllocError, Region};
-use slab::{SLAB, Slab};
+use slab::{SLAB, Slab, region_for};
 use std::alloc::{GlobalAlloc, Layout, alloc, dealloc};
 use std::ptr::NonNull;
 
@@ -58,7 +58,7 @@ fn each_boundary_lands_in_the_right_class() {
         (2048, 2048),
     ];
     for (size, class) in cases {
-        let buf = Buf::new(SLAB);
+        let buf = Buf::new(region_for(1));
         let s = buf.slab();
         let a = s.try_alloc(layout(size, 1)).unwrap().as_ptr().addr();
         let b = s.try_alloc(layout(size, 1)).unwrap().as_ptr().addr();
@@ -90,7 +90,8 @@ fn unsupported_requests_return_null() {
 
 #[test]
 fn alignment_up_to_2048() {
-    let buf = Buf::new(8 * SLAB);
+    // Twelve alignments land in eight classes, one slab each.
+    let buf = Buf::new(region_for(8));
     let s = buf.slab();
     for shift in 0..=11 {
         let align = 1 << shift;
@@ -101,7 +102,7 @@ fn alignment_up_to_2048() {
 
 #[test]
 fn zero_size_gets_a_real_block() {
-    let buf = Buf::new(SLAB);
+    let buf = Buf::new(region_for(1));
     let s = buf.slab();
     let a = s.try_alloc(layout(0, 1)).unwrap();
     let b = s.try_alloc(layout(0, 1)).unwrap();
@@ -116,7 +117,7 @@ fn zero_size_gets_a_real_block() {
 
 #[test]
 fn exhaustion_is_per_class() {
-    let buf = Buf::new(2 * SLAB);
+    let buf = Buf::new(region_for(2));
     let s = buf.slab();
     let small = layout(16, 1);
     let mut ps = Vec::new();
@@ -136,7 +137,7 @@ fn exhaustion_is_per_class() {
 
 #[test]
 fn region_smaller_than_a_slab_or_misaligned() {
-    let buf = Buf::new(3 * SLAB);
+    let buf = Buf::new(region_for(3));
     // SAFETY: prefix of the buffer, owned by this allocator only.
     let tiny = Slab::new(unsafe { Region::new(buf.ptr, SLAB - 1) });
     assert_eq!(tiny.capacity(), 0);
@@ -146,7 +147,7 @@ fn region_smaller_than_a_slab_or_misaligned() {
     let off = NonNull::new(buf.ptr.as_ptr().wrapping_add(1)).unwrap();
     // SAFETY: the rest of the buffer, also owned by this allocator only;
     // `tiny` is never used again.
-    let s = Slab::new(unsafe { Region::new(off, 3 * SLAB - 1) });
+    let s = Slab::new(unsafe { Region::new(off, region_for(3) - 1) });
     assert_eq!(s.capacity(), 2 * SLAB);
     let p = s.try_alloc(layout(1, 1)).unwrap().as_ptr().addr();
     assert_eq!(p, buf.ptr.as_ptr().addr() + SLAB);
@@ -154,7 +155,7 @@ fn region_smaller_than_a_slab_or_misaligned() {
 
 #[test]
 fn realloc_across_classes_keeps_data() {
-    let buf = Buf::new(4 * SLAB);
+    let buf = Buf::new(region_for(4));
     let s = buf.slab();
     // SAFETY: each pointer is used with the layout it currently has.
     unsafe {
@@ -181,7 +182,7 @@ fn realloc_across_classes_keeps_data() {
 
 #[test]
 fn zeroed_after_reuse() {
-    let buf = Buf::new(SLAB);
+    let buf = Buf::new(region_for(1));
     let s = buf.slab();
     let l = layout(64, 8);
     // SAFETY: the dirty block is freed before the zeroed one reuses it.
@@ -199,7 +200,7 @@ fn zeroed_after_reuse() {
 fn concurrent_classes() {
     // Each thread keeps about two thirds of its blocks, up to 2000 blocks of
     // 128 bytes for the largest class, so 1 MiB leaves room for all four.
-    let buf = Buf::new(256 * SLAB);
+    let buf = Buf::new(region_for(256));
     let s = buf.slab();
     let rounds = if cfg!(miri) { 30 } else { 3000 };
     std::thread::scope(|sc| {
