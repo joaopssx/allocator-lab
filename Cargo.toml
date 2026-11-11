@@ -8,3 +8,11 @@ edition = "2024"
 license = "MIT"
 authors = ["João Pedro"]
 publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
