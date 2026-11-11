@@ -1,6 +1,7 @@
 [package]
 name = "bench"
 description = "Benchmark harness comparing the allocators with the system allocator"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
