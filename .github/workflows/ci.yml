@@ -16,3 +16,37 @@ jobs:
       # rust-toolchain.toml pins the version; rustup on the runner picks it up.
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace
+      # stats and debug-checks on: every operation re-verifies the invariants.
+      - run: cargo test --workspace --all-features
+      - run: cargo run --release -p bench
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - run: cargo +nightly miri setup
+      # The default test profile is the fast one; LAB_FULL=1 is for local
+      # runs. bench is left out: six 16 MiB static arenas make it far too
+      # slow under the interpreter, and it has no tests.
+      - run: cargo +nightly miri test --workspace --exclude bench
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+      # The global allocator tests are where the aliasing model matters most,
+      # so run them under Tree Borrows too.
+      - run: >-
+          cargo +nightly miri test -p shared-tests
+          --test global_bump --test global_freelist
+          --test global_slab --test global_buddy
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-tree-borrows
