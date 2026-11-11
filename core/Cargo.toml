@@ -1,0 +1,8 @@
+[package]
+name = "alloc-core"
+description = "Shared building blocks for the allocators in allocator-lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
