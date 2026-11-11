@@ -1,70 +1,32 @@
-//! In-band free-list nodes and the free bitmap, both stored in region memory.
+//! The free bitmap, stored at the end of the region.
 //!
-//! The only module in the crate that dereferences region pointers.
+//! The only module in the crate that dereferences region pointers, and it
+//! only ever touches the bitmap area. Block memory is never read or written
+//! by the allocator, free or not: a block freed through a `Box` that is still
+//! a protected function argument can be reused without the allocator writing
+//! through a foreign pointer into it.
 
 use alloc_core::Region;
 
-/// End of a list.
-pub(crate) const NIL: usize = 0;
-
-/// Stored at the start of every free block. Doubly linked so a block can be
-/// unlinked in O(1) when its buddy merges with it.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct Node {
-    pub next: usize,
-    pub prev: usize,
-}
-
-const _: () = assert!(size_of::<Node>() <= crate::MIN);
-
-/// Reads the node of the free block at `addr`.
+/// Reads word `w` of the bitmap starting at `map`.
 ///
 /// # Safety
 ///
-/// `addr` must be a free block of this allocator.
-pub(crate) unsafe fn node(region: &Region, addr: usize) -> Node {
-    // SAFETY: free blocks are at least MIN bytes, aligned to MIN and start
-    // with a `Node` (caller contract).
-    unsafe { region.ptr(addr).cast::<Node>().read() }
+/// `map` must be 8-byte aligned and `map + 8 * w + 8` inside the bitmap area.
+pub(crate) unsafe fn word(region: &Region, map: usize, w: usize) -> u64 {
+    // SAFETY: aligned and inside the bitmap (caller contract), which no block
+    // ever overlaps.
+    unsafe { region.ptr(map + 8 * w).cast::<u64>().read() }
 }
 
-/// Writes the node of the block at `addr`.
+/// Writes word `w` of the bitmap starting at `map`.
 ///
 /// # Safety
 ///
-/// `addr` must be a block of this allocator that is free or being freed, so
-/// no live data sits under the node.
-pub(crate) unsafe fn set_node(region: &Region, addr: usize, n: Node) {
-    // SAFETY: aligned and in bounds as in `node`, and not live (caller
-    // contract).
-    unsafe { region.ptr(addr).cast::<Node>().write(n) }
-}
-
-/// Reads bit `idx` of the bitmap starting at `map`.
-///
-/// # Safety
-///
-/// `map + idx / 8` must be inside the bitmap area of the region.
-pub(crate) unsafe fn bit(region: &Region, map: usize, idx: usize) -> bool {
-    // SAFETY: the byte is inside the bitmap (caller contract).
-    unsafe { region.ptr(map + idx / 8).read() & (1 << (idx % 8)) != 0 }
-}
-
-/// Sets bit `idx` of the bitmap starting at `map`.
-///
-/// # Safety
-///
-/// `map + idx / 8` must be inside the bitmap area of the region.
-pub(crate) unsafe fn set_bit(region: &Region, map: usize, idx: usize, on: bool) {
-    let p = region.ptr(map + idx / 8);
-    let mask = 1u8 << (idx % 8);
-    // SAFETY: the byte is inside the bitmap (caller contract), which no
-    // block ever overlaps.
-    unsafe {
-        let b = p.read();
-        p.write(if on { b | mask } else { b & !mask });
-    }
+/// Same as [`word`].
+pub(crate) unsafe fn set_word(region: &Region, map: usize, w: usize, v: u64) {
+    // SAFETY: as in `word`.
+    unsafe { region.ptr(map + 8 * w).cast::<u64>().write(v) }
 }
 
 /// Clears `len` bytes of bitmap starting at `map`.

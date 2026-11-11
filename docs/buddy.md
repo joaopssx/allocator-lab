@@ -51,45 +51,56 @@ Alignments above 4096 are not supported, and those requests fail with
 
 The area does not have to be a power of two. When the allocator starts, it
 tiles the area with the largest blocks that fit, in decreasing size. For a
-12096-byte area that gives roots of 8192, 2048, 1024, 512, 256 and 64. Each
-root is aligned to its own size because the offsets before it are sums of
-larger powers of two. A root's buddy at the root's own order is never a real
-free block: either it lies past the end of the area, or it is the start of a
-smaller root. So merging can never join two roots.
+12096-byte area that gives roots of 8192, 2048, 1024, 512, 256 and 64, one
+per set bit of `12096 / 16`. Each root is aligned to its own size because the
+offsets before it are sums of larger powers of two. A root's buddy at the
+root's own order is never a real free block: either it lies past the end of
+the area, or it is the start of a smaller root. So merging can never join two
+roots.
 
-## The bitmap
+## Only a bitmap
 
-Merging needs to answer one question: is the buddy free, as a block of this
-exact order? I first planned to answer it from the free block itself, with an
-order and a magic number in the node. That would mean deciding "is this free?"
-by reading memory that might belong to a live block, and a user could store
-the magic number there. It is unlikely, but a correct allocator cannot rely on
-"unlikely".
+All the bookkeeping is a bitmap after the block area: one bit per possible
+block of each order, set while that block is free. Order `k` gets
+`space >> (4 + k)` bits, rounded up to a multiple of 64 so that it can be
+scanned a whole `u64` at a time. Together that is about `space / 64` bytes
+plus a word per order. `Geometry::new` picks the largest area whose bitmap
+still fits behind it, and `bitmap_bytes(space)` tells a caller how big a
+region needs to be for a given area.
 
-So there is a bitmap: one bit per possible block per order, set while that
-block is on its free list. Order `k` needs `space >> (4 + k)` bits. Summed over
-all orders that is under `space / 8` bits, i.e. under `space / 64` bytes, so
-the allocator reserves 1/65 of the region for the bitmap and the rest is block
-area. The bitmap is cleared once in `prepare`, and after that it is only
-touched by `push` and `remove`, which keep it in sync with the lists.
+Next to the bitmap, the state keeps a count of free blocks per order and a
+scan hint per order: a word index that is never past the lowest set bit of
+that order.
 
-The free lists are doubly linked, so the buddy found through the bitmap can be
-unlinked in O(1). The node (`next`, `prev`) is 16 bytes, which is why the
-smallest block is 16 bytes.
+This is the second version. The first one kept a doubly linked free list per
+order inside the free blocks themselves, with the bitmap only answering "is my
+buddy free?". It passed every test, including Miri on allocator instances.
+Then the integration tests installed it as `#[global_allocator]`, and Miri
+reported undefined behavior under both Stacked Borrows and Tree Borrows. Std
+frees a `Box<ThreadInit>` while that box is still a protected argument of the
+function freeing it, and `dealloc` wrote the free-list node into those same
+bytes through the region's pointer. From the aliasing model's point of view,
+that is a foreign write to memory a live `Box` still protects.
+
+The fix was to stop writing into blocks at all. With all the state in the
+bitmap, the allocator never touches the memory it hands out, free or live.
+`alloc_zeroed` is the only code that writes to a block, and only to a block
+it has just allocated.
 
 ## Operations
 
-**alloc**: find the smallest order `>= want` with a non-empty list, pop a
-block, and split it down: keep the lower half, push the upper half one order
-lower, repeat. Small requests split the smallest root that fits first, so the
-large blocks stay intact.
+**alloc**: find the smallest order `>= want` with a non-zero free count, scan
+that order's bitmap from its hint for the first set bit, clear it, and split
+down. Splitting keeps the lower half each time and sets the bit of the upper
+half one order lower. Small requests split the smallest root that fits
+first, so the large blocks stay intact.
 
 **dealloc**: the order comes back from the `Layout`, with no header. Then loop:
-if the buddy at this order is free, unlink it, keep the lower of the two
-addresses, go up one order. Push whatever remains.
+if the buddy's bit at this order is set, clear it, keep the lower of the two
+addresses and go up one order. Set the bit of whatever remains.
 
-**realloc**: shrinking is always in place, and the upper halves go back on the
-lists. Growing is in place when the block is the lower half at every level up
+**realloc**: shrinking is always in place, and the upper halves are marked
+free. Growing is in place when the block is the lower half at every level up
 to the target order and every buddy on the way is free. Otherwise it moves:
 take a new block, copy, free the old one with merging.
 
@@ -97,21 +108,27 @@ take a new block, copy, free the old one with merging.
 
 When the lock is not held:
 
-1. Every block on list `k` lies in the block area, at an offset that is a
-   multiple of `16 << k`.
-2. A block is on list `k` if and only if its bit for order `k` is set.
-3. Blocks on the lists are pairwise disjoint and disjoint from every live
-   block.
-4. No two buddies of the same order are both on list `k`. If they were, they
-   would have been merged.
+1. A set bit for order `k` describes a block that lies in the block area at
+   an offset that is a multiple of `16 << k`.
+2. `counts[k]` equals the number of set bits in order `k`'s part of the
+   bitmap, and `hints[k]` is at or before the word holding the lowest one.
+3. Free blocks (set bits, at any order) are pairwise disjoint and disjoint
+   from every live block.
+4. No two buddies of the same order are both free. If they were, they would
+   have been merged.
 
-The `debug-checks` feature walks every list and checks 1, 2 (in the "on list
-implies bit set" direction, and by counting set bits against list lengths) and
-4.
+The `debug-checks` feature verifies 2 by counting bits, and 4 by checking the
+buddy of every set bit. It verifies 3 by checking that no set bit has a set
+bit in a smaller order inside it.
 
 ## Costs
 
 Internal fragmentation is the price: everything rounds to a power of two, so
 a 1025-byte request takes 2048 bytes. External fragmentation stays limited
-because merging is eager and exact. The bitmap costs about 1.5% of the region,
-and the alignment of the base can cost up to 4095 bytes at the start.
+because merging is eager and exact. The bitmap costs about 1.6% of the
+region, and the alignment of the base can cost up to 4095 bytes at the start.
+
+Allocation used to pop a list head. Now it scans a bitmap. The hint keeps
+the common case short, but a pattern that frees low blocks and allocates high
+ones can make a scan walk many empty words. The benchmark report shows what
+this costs in practice.

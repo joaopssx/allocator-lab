@@ -1,7 +1,7 @@
 //! Split and merge round trips for the buddy allocator.
 
 use alloc_core::{AllocError, Region};
-use buddy::{Buddy, MAX_ALIGN, block_size, order_of};
+use buddy::{Buddy, MAX_ALIGN, bitmap_bytes, block_size, order_of};
 use std::alloc::{GlobalAlloc, Layout, alloc, dealloc};
 use std::ptr::NonNull;
 
@@ -36,9 +36,9 @@ fn layout(size: usize, align: usize) -> Layout {
     Layout::from_size_align(size, align).unwrap()
 }
 
-/// Region size whose block area is exactly `space` bytes, a power of two.
+/// Region size whose block area is exactly `space` bytes.
 fn sized_for(space: usize) -> usize {
-    space / 64 * 65 + 64
+    space + bitmap_bytes(space)
 }
 
 struct Lcg(u64);
@@ -114,7 +114,7 @@ fn oversized_and_zero_size_requests() {
 fn region_too_small() {
     let buf = Buf::new(4096);
     // SAFETY: a prefix of the buffer, used by this allocator only.
-    let b = Buddy::new(unsafe { Region::new(buf.ptr, 64) });
+    let b = Buddy::new(unsafe { Region::new(buf.ptr, 16) });
     assert_eq!(b.capacity(), 0);
     assert!(b.try_alloc(layout(1, 1)).is_err());
 }
