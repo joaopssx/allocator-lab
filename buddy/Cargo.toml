@@ -1,6 +1,7 @@
 [package]
 name = "buddy"
 description = "Binary buddy allocator with bitmap-backed merging"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
