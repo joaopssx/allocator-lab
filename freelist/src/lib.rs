@@ -197,6 +197,36 @@ impl FreeList {
         }
     }
 
+    /// Puts the used chunk whose payload starts at `payload` back on the list.
+    ///
+    /// # Safety
+    ///
+    /// `payload` must have been returned by this allocator and not freed
+    /// since.
+    unsafe fn release(&self, st: &mut State, payload: usize) {
+        let hdr = payload - UNIT;
+        // SAFETY: a live payload is always preceded by its header (caller
+        // contract), which is UNIT-aligned and inside the region.
+        let h = unsafe { raw::header(&self.region, hdr) };
+        debug_assert_eq!(h.tag, TAG, "freed pointer has no valid header");
+        self.insert(st, hdr, h.size);
+    }
+
+    /// Links the chunk `at..at + size` into the list, keeping address order.
+    fn insert(&self, st: &mut State, at: usize, size: usize) {
+        let mut prev = NIL;
+        let mut next = st.head;
+        while next != NIL && next < at {
+            prev = next;
+            // SAFETY: `next` comes from the free list.
+            next = unsafe { raw::node(&self.region, next) }.next;
+        }
+        // SAFETY: `at..at + size` was a used chunk that the caller gave up,
+        // so writing a node over its header aliases nothing live.
+        unsafe { raw::set_node(&self.region, at, Node { size, next }) };
+        self.relink(st, prev, at);
+    }
+
     fn prepare(&self, st: &mut State) {
         if st.ready {
             return;
@@ -237,8 +267,13 @@ unsafe impl GlobalAlloc for FreeList {
             .map_or(ptr::null_mut(), NonNull::as_ptr)
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Chunks are not given back yet.
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        let mut st = self.state.lock();
+        // SAFETY: the caller guarantees `ptr` came from this allocator and is
+        // still live.
+        unsafe { self.release(&mut st, ptr.addr()) };
+        #[cfg(feature = "stats")]
+        st.stats.on_dealloc(_layout.size());
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -290,6 +325,49 @@ mod tests {
             fl.try_alloc(Layout::from_size_align(1000, 1).unwrap())
                 .is_err()
         );
+
+        // SAFETY: allocated above with this layout.
+        unsafe { dealloc(base.as_ptr(), layout) };
+    }
+
+    /// Addresses of the free chunks, in list order.
+    fn chunks(fl: &FreeList) -> std::vec::Vec<(usize, usize)> {
+        let st = fl.state.lock();
+        let mut out = std::vec::Vec::new();
+        let mut at = st.head;
+        while at != NIL {
+            // SAFETY: walking the list under the lock.
+            let n = unsafe { raw::node(&fl.region, at) };
+            out.push((at, n.size));
+            at = n.next;
+        }
+        out
+    }
+
+    #[test]
+    fn dealloc_keeps_list_in_address_order() {
+        let layout = Layout::from_size_align(1024, 16).unwrap();
+        // SAFETY: non-zero layout.
+        let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        // SAFETY: the buffer outlives `fl` and only `fl` touches it.
+        let fl = FreeList::new(unsafe { Region::new(base, 1024) });
+        let l = Layout::from_size_align(48, 16).unwrap();
+
+        // SAFETY: each pointer is freed once, with its own layout.
+        unsafe {
+            let ps: std::vec::Vec<_> = (0..4).map(|_| fl.alloc(l)).collect();
+            // Free out of order, leaving a used block between each pair.
+            fl.dealloc(ps[2], l);
+            fl.dealloc(ps[0], l);
+
+            let list = chunks(&fl);
+            assert!(list.windows(2).all(|w| w[0].0 < w[1].0));
+            assert_eq!(list.len(), 3);
+            assert_eq!(fl.free_bytes(), 1024 - 2 * 64);
+
+            // First fit hands back the lowest freed block.
+            assert_eq!(fl.alloc(l), ps[0]);
+        }
 
         // SAFETY: allocated above with this layout.
         unsafe { dealloc(base.as_ptr(), layout) };

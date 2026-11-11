@@ -61,6 +61,18 @@ pub(crate) unsafe fn set_node(region: &Region, addr: usize, n: Node) {
     unsafe { region.ptr(addr).cast::<Node>().write(n) }
 }
 
+/// Reads the header of the used chunk at `addr`.
+///
+/// # Safety
+///
+/// `addr` must be the start of a used chunk inside `region`.
+pub(crate) unsafe fn header(region: &Region, addr: usize) -> Header {
+    // SAFETY: used chunks are UNIT-aligned and begin with a `Header` (caller
+    // contract). The header is never part of a payload, so this read does
+    // not race with the caller's data.
+    unsafe { region.ptr(addr).cast::<Header>().read() }
+}
+
 /// Writes the header of a used chunk at `addr`.
 ///
 /// # Safety
