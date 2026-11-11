@@ -8,7 +8,9 @@
 
 pub mod align;
 pub mod error;
+pub mod lock;
 pub mod region;
 
 pub use error::AllocError;
+pub use lock::SpinLock;
 pub use region::{Arena, Region};
