@@ -15,9 +15,13 @@
 mod raw;
 
 use alloc_core::align::{align_down, align_up};
-use alloc_core::{Region, SpinLock};
-use core::alloc::Layout;
+use alloc_core::{AllocError, Region, SpinLock};
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::{self, NonNull};
 use raw::{NIL, Node};
+
+#[cfg(feature = "stats")]
+use alloc_core::Stats;
 
 /// Size of an order-0 block. Also the size of a free-list node.
 pub const MIN: usize = 16;
@@ -59,6 +63,8 @@ struct State {
     geo: Geometry,
     /// Head of the free list of each order, or `NIL`.
     heads: [usize; ORDERS],
+    #[cfg(feature = "stats")]
+    stats: Stats,
 }
 
 /// Where things live inside the region. Computed once, from the region alone.
@@ -130,6 +136,8 @@ impl Buddy {
                 ready: false,
                 geo: Geometry::EMPTY,
                 heads: [NIL; ORDERS],
+                #[cfg(feature = "stats")]
+                stats: Stats::new(),
             }),
         }
     }
@@ -159,6 +167,77 @@ impl Buddy {
             }
         }
         total
+    }
+
+    /// Snapshot of the allocation counters.
+    #[cfg(feature = "stats")]
+    pub fn stats(&self) -> Stats {
+        self.state.lock().stats
+    }
+
+    /// Allocates the smallest block that fits `layout`.
+    ///
+    /// Fails with [`AllocError::Unsupported`] if the alignment is above
+    /// [`MAX_ALIGN`], and with [`AllocError::Exhausted`] if no free block is
+    /// large enough.
+    pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        let mut st = self.state.lock();
+        self.prepare(&mut st);
+        let res = match order_of(layout) {
+            Some(k) => self.take(&mut st, k),
+            None if layout.align() > MAX_ALIGN => Err(AllocError::Unsupported),
+            None => Err(AllocError::Exhausted),
+        };
+        #[cfg(feature = "stats")]
+        match res {
+            Ok(_) => st.stats.on_alloc(layout.size()),
+            Err(_) => st.stats.on_failure(),
+        }
+        res.map(|addr| NonNull::new(self.region.ptr(addr)).unwrap_or(NonNull::dangling()))
+    }
+
+    /// Takes a free block of order `want`, splitting a larger one if needed.
+    fn take(&self, st: &mut State, want: usize) -> Result<usize, AllocError> {
+        let mut k = (want..ORDERS)
+            .find(|&k| st.heads[k] != NIL)
+            .ok_or(AllocError::Exhausted)?;
+        let addr = st.heads[k];
+        // SAFETY: `addr` heads list `k`.
+        unsafe { self.remove(st, k, addr) };
+        // Keep the lower half each time and put the upper half on the list
+        // one order down.
+        while k > want {
+            k -= 1;
+            // SAFETY: the upper half of a block that just left the lists is
+            // free, inside the area and aligned to its own size.
+            unsafe { self.push(st, k, addr + block_size(k)) };
+        }
+        Ok(addr)
+    }
+
+    /// Unlinks the order-`k` block at `addr` from list `k`.
+    ///
+    /// # Safety
+    ///
+    /// The block must be on list `k`.
+    unsafe fn remove(&self, st: &mut State, k: usize, addr: usize) {
+        // SAFETY: `addr` and its neighbors on the list are free blocks.
+        unsafe {
+            let n = raw::node(&self.region, addr);
+            if n.prev == NIL {
+                st.heads[k] = n.next;
+            } else {
+                let mut p = raw::node(&self.region, n.prev);
+                p.next = n.next;
+                raw::set_node(&self.region, n.prev, p);
+            }
+            if n.next != NIL {
+                let mut x = raw::node(&self.region, n.next);
+                x.prev = n.prev;
+                raw::set_node(&self.region, n.next, x);
+            }
+            raw::set_bit(&self.region, st.geo.map, st.geo.bit(k, addr), false);
+        }
     }
 
     /// Puts the order-`k` block at `addr` at the head of list `k`.
@@ -218,6 +297,44 @@ impl Buddy {
     }
 }
 
+// SAFETY: a block is handed out only after leaving its free list, and the
+// lists only ever hold disjoint blocks: the initial roots tile the area, and
+// splitting replaces a block by its two halves. Blocks of order `k` sit at
+// multiples of `block_size(k)` from a base aligned to `MAX_ALIGN`, and
+// `order_of` picks `k` so that `block_size(k)` covers both the size and the
+// alignment. The bitmap lives past the block area, so no block overlaps it.
+// Everything happens under the lock.
+unsafe impl GlobalAlloc for Buddy {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.try_alloc(layout)
+            .map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let Some(k) = order_of(layout) else {
+            debug_assert!(false, "dealloc with a layout buddy never serves");
+            return;
+        };
+        let mut st = self.state.lock();
+        // SAFETY: `ptr` is a live block of order `k` (caller contract), and
+        // the caller gives it up.
+        unsafe { self.push(&mut st, k, ptr.addr()) };
+        #[cfg(feature = "stats")]
+        st.stats.on_dealloc(layout.size());
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = self
+            .try_alloc(layout)
+            .map_or(ptr::null_mut(), NonNull::as_ptr);
+        if !p.is_null() {
+            // SAFETY: fresh block of at least `layout.size()` bytes.
+            unsafe { ptr::write_bytes(p, 0, layout.size()) };
+        }
+        p
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -258,6 +375,35 @@ mod tests {
         let roots: std::vec::Vec<_> = (0..ORDERS).filter(|&k| st.heads[k] != NIL).collect();
         assert_eq!(roots, [2, 4, 5, 6, 7, 9]);
         drop(st);
+
+        // SAFETY: allocated above with this layout.
+        unsafe { dealloc(base.as_ptr(), layout) };
+    }
+
+    #[test]
+    fn alloc_splits_down_to_the_right_order() {
+        let size = 2 * 4096;
+        let layout = Layout::from_size_align(size, 4096).unwrap();
+        // SAFETY: non-zero layout.
+        let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        // SAFETY: the buffer outlives `b` and only `b` touches it.
+        let b = Buddy::new(unsafe { Region::new(base, size) });
+        let start = base.as_ptr().addr();
+        let cap = b.capacity();
+
+        // The area is 8064 bytes: roots of 4096 down to 128. A small request
+        // splits the smallest root that fits, the 128 one at the end, rather
+        // than breaking up the big blocks.
+        assert_eq!(cap, 8064);
+        let p = b.try_alloc(l(16, 1)).unwrap().as_ptr().addr();
+        let q = b.try_alloc(l(16, 1)).unwrap().as_ptr().addr();
+        let r = b.try_alloc(l(32, 1)).unwrap().as_ptr().addr();
+        assert_eq!((p - start, q - start, r - start), (7936, 7952, 7968));
+        assert_eq!(b.free_bytes(), cap - 64);
+
+        let page = b.try_alloc(l(1, 4096)).unwrap().as_ptr().addr();
+        assert_eq!(page % 4096, 0);
+        assert!(b.try_alloc(l(1, 8192)).is_err());
 
         // SAFETY: allocated above with this layout.
         unsafe { dealloc(base.as_ptr(), layout) };
