@@ -10,7 +10,11 @@ pub mod align;
 pub mod error;
 pub mod lock;
 pub mod region;
+#[cfg(feature = "stats")]
+pub mod stats;
 
 pub use error::AllocError;
 pub use lock::SpinLock;
 pub use region::{Arena, Region};
+#[cfg(feature = "stats")]
+pub use stats::Stats;
