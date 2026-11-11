@@ -13,6 +13,8 @@ alloc-core = { path = "../core" }
 
 [features]
 stats = ["alloc-core/stats"]
+# Verify the invariants in docs/ after every operation. Slow; for tests.
+debug-checks = []
 
 [lints]
 workspace = true

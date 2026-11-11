@@ -243,7 +243,57 @@ impl Buddy {
             Ok(_) => st.stats.on_alloc(layout.size()),
             Err(_) => st.stats.on_failure(),
         }
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
         res.map(|addr| NonNull::new(self.region.ptr(addr)).unwrap_or(NonNull::dangling()))
+    }
+
+    /// Checks invariants 2 to 4 listed in `docs/buddy.md`. Invariant 1 holds
+    /// by construction of the bit index.
+    #[cfg(feature = "debug-checks")]
+    fn verify(&self, st: &State) {
+        use alloc_core::broken;
+        let geo = st.geo;
+        for k in 0..ORDERS {
+            let n = geo.count(k);
+            let (first, last) = (geo.starts[k] / 64, (geo.starts[k] + n).div_ceil(64));
+            let mut set = 0;
+            let mut lowest = None;
+            for w in first..last {
+                // SAFETY: `w` is a word of order `k`'s part of the bitmap.
+                let mut bits = unsafe { raw::word(&self.region, geo.map, w) };
+                if bits != 0 && lowest.is_none() {
+                    lowest = Some(w);
+                }
+                while bits != 0 {
+                    let idx = w * 64 + bits.trailing_zeros() as usize - geo.starts[k];
+                    bits &= bits - 1;
+                    set += 1;
+                    if idx >= n {
+                        broken("buddy: free bit past the last block of its order");
+                    }
+                    let addr = geo.base + idx * block_size(k);
+                    if self.is_free(st, k, geo.buddy(k, addr)) {
+                        broken("buddy: two free buddies not merged");
+                    }
+                    for j in k + 1..ORDERS {
+                        let up = geo.base + ((addr - geo.base) & !(block_size(j) - 1));
+                        if !geo.fits(j, up) {
+                            break;
+                        }
+                        if self.is_free(st, j, up) {
+                            broken("buddy: free block inside another free block");
+                        }
+                    }
+                }
+            }
+            if set != st.counts[k] {
+                broken("buddy: free count disagrees with the bitmap");
+            }
+            if lowest.is_some_and(|l| st.hints[k] > l) {
+                broken("buddy: scan hint past a free block");
+            }
+        }
     }
 
     /// Takes a free block of order `want`, splitting a larger one if needed.
@@ -277,7 +327,7 @@ impl Buddy {
                 return geo.base + idx * block_size(k);
             }
         }
-        unreachable!("free count and bitmap disagree");
+        alloc_core::broken("buddy: free count and bitmap disagree");
     }
 
     /// Sets or clears the free bit of the order-`k` block at `addr`, keeping
@@ -289,7 +339,11 @@ impl Buddy {
         // bitmap.
         unsafe {
             let bits = raw::word(&self.region, st.geo.map, w);
-            debug_assert_eq!(bits & mask != 0, !free, "bit already in that state");
+            if (cfg!(debug_assertions) || cfg!(feature = "debug-checks"))
+                && (bits & mask != 0) == free
+            {
+                alloc_core::broken("buddy: block already in that state (double free?)");
+            }
             let bits = if free { bits | mask } else { bits & !mask };
             raw::set_word(&self.region, st.geo.map, w, bits);
         }
@@ -397,13 +451,17 @@ unsafe impl GlobalAlloc for Buddy {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let Some(k) = order_of(layout) else {
-            debug_assert!(false, "dealloc with a layout buddy never serves");
+            if cfg!(debug_assertions) || cfg!(feature = "debug-checks") {
+                alloc_core::broken("buddy: dealloc with a layout it never serves");
+            }
             return;
         };
         let mut st = self.state.lock();
         self.release(&mut st, k, ptr.addr());
         #[cfg(feature = "stats")]
         st.stats.on_dealloc(layout.size());
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -443,6 +501,8 @@ unsafe impl GlobalAlloc for Buddy {
             Ok(_) => st.stats.on_realloc(layout.size(), new_size),
             Err(_) => st.stats.on_failure(),
         }
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
         res.unwrap_or(ptr::null_mut())
     }
 }

@@ -59,6 +59,10 @@ struct State {
     /// Where next fit resumes its search. Just an address, not necessarily
     /// a chunk, so merging and splitting never have to update it.
     rover: usize,
+    /// Total size of all used chunks, kept only to check that used and free
+    /// chunks together cover the span.
+    #[cfg(feature = "debug-checks")]
+    used: usize,
     #[cfg(feature = "stats")]
     stats: Stats,
 }
@@ -73,6 +77,8 @@ impl FreeList {
                 head: NIL,
                 ready: false,
                 rover: 0,
+                #[cfg(feature = "debug-checks")]
+                used: 0,
                 #[cfg(feature = "stats")]
                 stats: Stats::new(),
             }),
@@ -159,7 +165,45 @@ impl FreeList {
             Ok(_) => st.stats.on_alloc(layout.size()),
             Err(_) => st.stats.on_failure(),
         }
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
         res.map(|p| self.nonnull(p))
+    }
+
+    /// Checks the invariants listed in `docs/freelist.md`.
+    #[cfg(feature = "debug-checks")]
+    fn verify(&self, st: &State) {
+        use alloc_core::broken;
+        let (start, end) = self.span();
+        let mut at = st.head;
+        let mut prev_end: Option<usize> = None;
+        let mut free = 0;
+        let mut steps = 0;
+        while at != NIL {
+            if !at.is_multiple_of(UNIT) || at < start || at >= end {
+                broken("freelist: free chunk misaligned or outside the span");
+            }
+            // SAFETY: just checked that `at` is a chunk start inside the span.
+            let n = unsafe { raw::node(&self.region, at) };
+            if n.size < UNIT || !n.size.is_multiple_of(UNIT) || n.size > end - at {
+                broken("freelist: free chunk with a bad size");
+            }
+            match prev_end {
+                Some(pe) if at < pe => broken("freelist: free list out of order"),
+                Some(pe) if at == pe => broken("freelist: adjacent free chunks not merged"),
+                _ => {}
+            }
+            prev_end = Some(at + n.size);
+            free += n.size;
+            steps += 1;
+            if steps > (end - start) / UNIT {
+                broken("freelist: free list has a cycle");
+            }
+            at = n.next;
+        }
+        if free + st.used != end - start {
+            broken("freelist: free and used chunks do not cover the span");
+        }
     }
 
     fn nonnull(&self, addr: usize) -> NonNull<u8> {
@@ -257,6 +301,10 @@ impl FreeList {
         // SAFETY: `hdr..payload` is UNIT bytes inside the old free chunk and
         // does not overlap either leftover node written above.
         unsafe { raw::set_header(&self.region, hdr, h) };
+        #[cfg(feature = "debug-checks")]
+        {
+            st.used += end - hdr;
+        }
     }
 
     /// Points `prev` (or the head, if `prev` is `NIL`) at `to`.
@@ -283,7 +331,13 @@ impl FreeList {
         // SAFETY: a live payload is always preceded by its header (caller
         // contract), which is UNIT-aligned and inside the region.
         let h = unsafe { raw::header(&self.region, hdr) };
-        debug_assert_eq!(h.tag, TAG, "freed pointer has no valid header");
+        if (cfg!(debug_assertions) || cfg!(feature = "debug-checks")) && h.tag != TAG {
+            alloc_core::broken("freelist: freed pointer has no valid header");
+        }
+        #[cfg(feature = "debug-checks")]
+        {
+            st.used -= h.size;
+        }
         self.insert(st, hdr, h.size);
     }
 
@@ -360,6 +414,10 @@ impl FreeList {
                 // SAFETY: the chunk keeps `hdr..need`, a prefix of itself.
                 unsafe { self.set_size(hdr, need - hdr) };
                 self.insert(st, need, end - need);
+                #[cfg(feature = "debug-checks")]
+                {
+                    st.used -= end - need;
+                }
             }
             return true;
         }
@@ -388,6 +446,10 @@ impl FreeList {
         // SAFETY: `end..need` was just unlinked from the free list, so the
         // chunk now owns `hdr..need`.
         unsafe { self.set_size(hdr, need - hdr) };
+        #[cfg(feature = "debug-checks")]
+        {
+            st.used += need - end;
+        }
         true
     }
 
@@ -460,6 +522,8 @@ unsafe impl GlobalAlloc for FreeList {
         unsafe { self.release(&mut st, ptr.addr()) };
         #[cfg(feature = "stats")]
         st.stats.on_dealloc(_layout.size());
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -500,6 +564,8 @@ unsafe impl GlobalAlloc for FreeList {
             Ok(_) => st.stats.on_realloc(layout.size(), new_size),
             Err(_) => st.stats.on_failure(),
         }
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
         res.unwrap_or(ptr::null_mut())
     }
 }

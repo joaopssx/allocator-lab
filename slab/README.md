@@ -24,6 +24,8 @@ more than 2048 bytes at once. The libtest harness is not one of them. It is
 more useful as an explicit allocator for small objects. `slab::region_for(n)`
 gives the region size for exactly `n` slabs.
 
-Features: `stats` enables `Slab::stats()`.
+Features: `stats` enables `Slab::stats()`. `debug-checks` verifies the invariants
+from the design doc after every operation and aborts with a message if one
+breaks. It is slow and meant for tests.
 
 Design, fragmentation trade-offs and invariants: [docs/slab.md](../docs/slab.md).

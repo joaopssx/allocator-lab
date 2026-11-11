@@ -17,6 +17,16 @@ slab = { path = "../slab" }
 [lints]
 workspace = true
 
+[features]
+# Runs every test with the allocators verifying their invariants after each
+# operation.
+debug-checks = [
+    "bump/debug-checks",
+    "buddy/debug-checks",
+    "freelist/debug-checks",
+    "slab/debug-checks",
+]
+
 [dev-dependencies]
 proptest = "1.12.0"
 

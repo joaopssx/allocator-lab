@@ -21,6 +21,8 @@ Alignments up to 4096 are supported. Above that, allocation returns null.
 `buddy::bitmap_bytes(space)` gives the extra bytes a region needs for a block
 area of `space` bytes.
 
-Features: `stats` enables `Buddy::stats()`.
+Features: `stats` enables `Buddy::stats()`. `debug-checks` verifies the invariants
+from the design doc after every operation and aborts with a message if one
+breaks. It is slow and meant for tests.
 
 Design, the bit math and invariants: [docs/buddy.md](../docs/buddy.md).

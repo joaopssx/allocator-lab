@@ -15,6 +15,8 @@ static ARENA: Arena<{ 1 << 20 }> = Arena::new();
 static HEAP: Bump = Bump::new(unsafe { ARENA.region() });
 ```
 
-Features: `stats` enables `Bump::stats()`.
+Features: `stats` enables `Bump::stats()`. `debug-checks` verifies the invariants
+from the design doc after every operation and aborts with a message if one
+breaks. It is slow and meant for tests.
 
 Design and invariants: [docs/bump.md](../docs/bump.md).

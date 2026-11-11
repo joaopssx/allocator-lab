@@ -19,6 +19,8 @@ static HEAP: FreeList = FreeList::new(unsafe { ARENA.region() }, Fit::First);
 Every block costs a 16-byte header, and sizes round up to 16 bytes. Freeing is
 O(free chunks), because of the walk to the insertion point.
 
-Features: `stats` enables `FreeList::stats()`.
+Features: `stats` enables `FreeList::stats()`. `debug-checks` verifies the invariants
+from the design doc after every operation and aborts with a message if one
+breaks. It is slow and meant for tests.
 
 Design and invariants: [docs/freelist.md](../docs/freelist.md).

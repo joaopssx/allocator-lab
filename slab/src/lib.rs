@@ -166,7 +166,59 @@ impl Slab {
             Ok(_) => st.stats.on_alloc(layout.size()),
             Err(_) => st.stats.on_failure(),
         }
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
         res.map(|addr| NonNull::new(self.region.ptr(addr)).unwrap_or(NonNull::dangling()))
+    }
+
+    /// Checks invariants 1 to 3 listed in `docs/slab.md`.
+    #[cfg(feature = "debug-checks")]
+    fn verify(&self, st: &State) {
+        use alloc_core::broken;
+        if st.carved > st.geo.slabs {
+            broken("slab: more slabs carved than fit");
+        }
+        let mut listed = 0;
+        for (idx, &head) in st.partial.iter().enumerate() {
+            let n = SLAB / class::size(idx);
+            let mut at = head;
+            let mut steps = 0;
+            while at != 0 {
+                let s = at - 1;
+                if s >= st.carved {
+                    broken("slab: uncarved slab on a class list");
+                }
+                // SAFETY: `s` is carved, so its entry was written.
+                let m = unsafe { raw::meta(&self.region, st.geo.entry(s)) };
+                let bits: usize = m.free.iter().map(|w| w.count_ones() as usize).sum();
+                if bits != m.nfree {
+                    broken("slab: free count disagrees with the bitmap");
+                }
+                if m.nfree == 0 {
+                    broken("slab: full slab on a class list");
+                }
+                for (w, word) in m.free.iter().enumerate() {
+                    let valid = n.saturating_sub(w * 64).min(64);
+                    let mask = if valid == 64 { !0 } else { (1u64 << valid) - 1 };
+                    if word & !mask != 0 {
+                        broken("slab: free bit set past the last block");
+                    }
+                }
+                listed += 1;
+                steps += 1;
+                if steps > st.carved {
+                    broken("slab: class list has a cycle");
+                }
+                at = m.next;
+            }
+        }
+        let with_free = (0..st.carved)
+            // SAFETY: every slab below `carved` has an entry.
+            .filter(|&s| unsafe { raw::meta(&self.region, st.geo.entry(s)) }.nfree > 0)
+            .count();
+        if listed != with_free {
+            broken("slab: a slab with free blocks is missing from the lists, or listed twice");
+        }
     }
 
     fn prepare(&self, st: &mut State) {
@@ -213,7 +265,11 @@ impl Slab {
         let e = st.geo.entry(s);
         // SAFETY: a live block lies in a carved slab (caller contract).
         let mut m = unsafe { raw::meta(&self.region, e) };
-        debug_assert!(m.free[i / 64] & (1 << (i % 64)) == 0, "double free");
+        if (cfg!(debug_assertions) || cfg!(feature = "debug-checks"))
+            && m.free[i / 64] & (1 << (i % 64)) != 0
+        {
+            alloc_core::broken("slab: double free");
+        }
         m.free[i / 64] |= 1 << (i % 64);
         m.nfree += 1;
         if m.nfree == 1 {
@@ -264,7 +320,9 @@ unsafe impl GlobalAlloc for Slab {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // A layout with no class could not have produced a pointer.
         let Some(idx) = class::of(layout) else {
-            debug_assert!(false, "dealloc with a layout slab never serves");
+            if cfg!(debug_assertions) || cfg!(feature = "debug-checks") {
+                alloc_core::broken("slab: dealloc with a layout it never serves");
+            }
             return;
         };
         let mut st = self.state.lock();
@@ -273,6 +331,8 @@ unsafe impl GlobalAlloc for Slab {
         unsafe { self.give(&mut st, idx, ptr.addr()) };
         #[cfg(feature = "stats")]
         st.stats.on_dealloc(layout.size());
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -312,6 +372,8 @@ unsafe impl GlobalAlloc for Slab {
             Ok(_) => st.stats.on_realloc(layout.size(), new_size),
             Err(_) => st.stats.on_failure(),
         }
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
         res.unwrap_or(ptr::null_mut())
     }
 }

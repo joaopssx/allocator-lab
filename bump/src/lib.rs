@@ -98,6 +98,8 @@ impl Bump {
         st.last = None;
         #[cfg(feature = "stats")]
         st.stats.on_reset();
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
     }
 
     /// Allocates a block for `layout`.
@@ -113,7 +115,20 @@ impl Bump {
             Ok(_) => st.stats.on_alloc(layout.size()),
             Err(_) => st.stats.on_failure(),
         }
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
         res
+    }
+
+    /// Checks the invariants listed in `docs/bump.md`.
+    #[cfg(feature = "debug-checks")]
+    fn verify(&self, st: &State) {
+        if st.next > self.region.size() {
+            alloc_core::broken("bump: cursor past the end of the region");
+        }
+        if st.last.is_some_and(|l| l >= st.next) {
+            alloc_core::broken("bump: last block starts at or past the cursor");
+        }
     }
 
     fn bump(&self, st: &mut State, layout: Layout) -> Result<NonNull<u8>, AllocError> {
@@ -197,6 +212,8 @@ unsafe impl GlobalAlloc for Bump {
             Ok(_) => st.stats.on_realloc(layout.size(), new_size),
             Err(_) => st.stats.on_failure(),
         }
+        #[cfg(feature = "debug-checks")]
+        self.verify(&st);
         res.unwrap_or(ptr::null_mut())
     }
 }
