@@ -274,6 +274,31 @@ impl Buddy {
         ok
     }
 
+    /// Frees the order-`k` block at `addr`, merging it with its buddy for as
+    /// long as the buddy is free too.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must be a live block of order `k`, and the caller gives it up.
+    unsafe fn release(&self, st: &mut State, mut k: usize, mut addr: usize) {
+        while k + 1 < ORDERS {
+            let b = st.geo.buddy(k, addr);
+            // A free buddy of the same order means both halves of the parent
+            // are free, and the parent is a real block: buddies at the same
+            // order never straddle two roots (see `prepare`).
+            if !self.is_free(st, k, b) {
+                break;
+            }
+            // SAFETY: `is_free` just confirmed `b` is on list `k`.
+            unsafe { self.remove(st, k, b) };
+            addr = addr.min(b);
+            k += 1;
+        }
+        // SAFETY: `addr` is now the merged block, made of the caller's block
+        // and buddies just taken off the lists, so it is free and on no list.
+        unsafe { self.push(st, k, addr) };
+    }
+
     /// Unlinks the order-`k` block at `addr` from list `k`.
     ///
     /// # Safety
@@ -377,7 +402,7 @@ unsafe impl GlobalAlloc for Buddy {
         let mut st = self.state.lock();
         // SAFETY: `ptr` is a live block of order `k` (caller contract), and
         // the caller gives it up.
-        unsafe { self.push(&mut st, k, ptr.addr()) };
+        unsafe { self.release(&mut st, k, ptr.addr()) };
         #[cfg(feature = "stats")]
         st.stats.on_dealloc(layout.size());
     }
@@ -412,7 +437,7 @@ unsafe impl GlobalAlloc for Buddy {
                 // is released after the copy.
                 unsafe {
                     ptr::copy_nonoverlapping(ptr, dst, layout.size());
-                    self.push(&mut st, k, ptr.addr());
+                    self.release(&mut st, k, ptr.addr());
                 }
                 dst
             })
@@ -530,6 +555,60 @@ mod tests {
             let r2 = b.realloc(r, l(32, 1), 64);
             assert_ne!(r2, r);
             assert_eq!(r2.read(), 5);
+        }
+        // SAFETY: allocated above with this layout.
+        unsafe { dealloc(base.as_ptr(), layout) };
+    }
+
+    /// Orders that have a non-empty list.
+    fn orders_in_use(b: &Buddy) -> std::vec::Vec<usize> {
+        let mut st = b.state.lock();
+        b.prepare(&mut st);
+        (0..ORDERS).filter(|&k| st.heads[k] != NIL).collect()
+    }
+
+    #[test]
+    fn freeing_everything_merges_back_to_the_roots() {
+        let size = 3 * 4096;
+        let layout = Layout::from_size_align(size, 4096).unwrap();
+        // SAFETY: non-zero layout.
+        let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        // SAFETY: the buffer outlives `b` and only `b` touches it.
+        let b = Buddy::new(unsafe { Region::new(base, size) });
+        let roots = orders_in_use(&b);
+
+        let sizes = [16, 100, 16, 700, 32, 3000, 16, 64, 250, 16];
+        // SAFETY: each block is freed once with its own layout.
+        unsafe {
+            let ps: std::vec::Vec<_> = sizes.iter().map(|&s| (b.alloc(l(s, 1)), s)).collect();
+            assert!(ps.iter().all(|(p, _)| !p.is_null()));
+            for i in [3, 0, 9, 5, 1, 7, 2, 8, 6, 4] {
+                b.dealloc(ps[i].0, l(ps[i].1, 1));
+            }
+        }
+        assert_eq!(b.free_bytes(), b.capacity());
+        assert_eq!(orders_in_use(&b), roots);
+        // SAFETY: allocated above with this layout.
+        unsafe { dealloc(base.as_ptr(), layout) };
+    }
+
+    #[test]
+    fn merge_stops_at_a_live_buddy() {
+        let size = 4096 * 65 / 64 + 64;
+        let layout = Layout::from_size_align(size, 4096).unwrap();
+        // SAFETY: non-zero layout.
+        let base = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        // SAFETY: the buffer outlives `b` and only `b` touches it.
+        let b = Buddy::new(unsafe { Region::new(base, size) });
+        // SAFETY: each block is freed once with its own layout.
+        unsafe {
+            let p = b.alloc(l(16, 1));
+            let q = b.alloc(l(16, 1));
+            b.dealloc(p, l(16, 1));
+            // `q` is still live, so `p` stays an order-0 block.
+            assert_eq!(orders_in_use(&b), (0..8).collect::<std::vec::Vec<_>>());
+            b.dealloc(q, l(16, 1));
+            assert_eq!(orders_in_use(&b), [8]);
         }
         // SAFETY: allocated above with this layout.
         unsafe { dealloc(base.as_ptr(), layout) };
