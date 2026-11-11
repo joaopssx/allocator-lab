@@ -12,3 +12,10 @@ version = "0.1.0"
 dependencies = [
  "alloc-core",
 ]
+
+[[package]]
+name = "freelist"
+version = "0.1.0"
+dependencies = [
+ "alloc-core",
+]
